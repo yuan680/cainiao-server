@@ -613,10 +613,7 @@ def _cache_get(key: str) -> Optional[dict]:
     """从缓存读取，命中则刷新 LRU 顺序。"""
     entry = _QUERY_CACHE.get(key)
     if entry is None:
-        re全局冷却检查（短时间失败太多时强制定速） ---
-    _check_global_cooldown()
-
-    # --- turn None
+        return None
     ts, result = entry
     if time.time() - ts > _CACHE_TTL:
         # 过期
@@ -731,7 +728,6 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                                 _CAINIAO_SESSION.get(
                                     punish_url,
                                     proxies=proxies,
-                _record_success()
                                     verify=False,
                                     timeout=10,
                                 )
@@ -761,7 +757,6 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                         # 冷却后轮换 Session（如果已累计到阈值）
                         _maybe_rotate_session()
                         continue  # 不计入普通重试
-        _record_failure()
 
                     normal_attempt += 1
                     if normal_attempt < max_retries:
@@ -815,7 +810,6 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
             if raw and raw.get("success") is not False:
                 log(f"[OK] Playwright 成功查询 {mail_no}")
                 _cache_set(cache_key, raw)
-    _record_failure()
                 return raw
             log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
         except Exception as pw_e:
