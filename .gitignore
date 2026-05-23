@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Logs
+*.log
+*.txt
+server_*.log
+server_*.txt
+
+# Executables
+*.exe
+
+# Test / probe scripts
+probe_*.js
+wps_airscript_direct.js
+wps_button_*.js
+wps_field_diagnostic.js
+wps_macro_tracking*.js
+wps_test_step1.js
+
+# Other generated
+*.csv
+b64*.txt
+_emoji_report.txt
+test_api.json
+
+# Config with secrets
+config.json

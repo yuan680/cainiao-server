@@ -1,0 +1,28 @@
+# 云部署忽略
+__pycache__/
+*.pyc
+*.pyo
+.env
+config.json
+
+# 本地工具（不需要打包进镜像）
+*.exe
+*.bat
+*.ps1
+*.sh
+*.csv
+*.log
+*.txt
+
+# 构建产物
+build/
+dist/
+*.spec
+
+# 旧脚本（保留在仓库中但不进镜像）
+probe_*.js
+wps_*.js
+b64*.txt
+start_helper.ps1
+ngrok.exe
+bore.exe
