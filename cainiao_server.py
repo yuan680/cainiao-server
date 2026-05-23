@@ -37,6 +37,9 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from typing import Optional
 
+# 每个 HTTP 请求的上下文（线程本地）
+_req_ctx = threading.local()
+
 # ============================================================
 # Google Sheets 写入（可选懒加载）
 # ============================================================
@@ -106,16 +109,56 @@ from curl_cffi import requests
 # 云部署（Cloud Run / Docker）内置 Playwright 基镜像，可用浏览器兜底
 # curl_cffi 优先，限流时降级到 Playwright（1GB RAM 足够跑 Chromium）
 USE_PLAYWRIGHT = True
-# 每次查询前的随机延时范围（秒），避免触发风控
-# 串行查询时 0.5~1.5s/个，真人操作节奏
-QUERY_DELAY_MIN = 0.5
-QUERY_DELAY_MAX = 1.5
+# 每次查询前的随机延时范围（秒），加入更大抖动模拟人类操作
+# 批量场景下：0.8-1.5s 太规律，放大到 1.0-3.0s 更不容易触发限流
+QUERY_DELAY_MIN = 1.0
+QUERY_DELAY_MAX = 3.0
+
+# 全局冷却：当短时间内失败太多时，强制所有查询等待
+_GLOBAL_COOLDOWN = 0.0          # 下次查询前需等待的时间戳（time.time）
+_GLOBAL_COOLDOWN_LOCK = threading.Lock()
+_GLOBAL_FAIL_WINDOW = []        # 最近失败时间戳（用于滑动窗口计数）
+_GLOBAL_FAIL_WINDOW_LOCK = threading.Lock()
+_GLOBAL_FAIL_THRESHOLD = 3      # 10 秒内超过 3 次失败 → 触发全局冷却
+_GLOBAL_COOLDOWN_SECONDS = 15   # 触发后冷却 15 秒
+
+def _check_global_cooldown():
+    """检查是否需要全局冷却；若需要则等待。"""
+    global _GLOBAL_COOLDOWN
+    wait = 0.0
+    with _GLOBAL_COOLDOWN_LOCK:
+        now = time.time()
+        if now < _GLOBAL_COOLDOWN:
+            wait = _GLOBAL_COOLDOWN - now
+    if wait > 0:
+        capped = min(wait, 30)
+        log(f"[GLOBAL] 全局冷却中，等待 {capped:.0f}s…")
+        time.sleep(capped)
+
+def _record_failure():
+    """记录一次失败；若滑动窗口内失败数超阈值，触发全局冷却。"""
+    global _GLOBAL_COOLDOWN
+    now = time.time()
+    with _GLOBAL_FAIL_WINDOW_LOCK:
+        _GLOBAL_FAIL_WINDOW.append(now)
+        # 只保留最近 10 秒
+        _GLOBAL_FAIL_WINDOW[:] = [t for t in _GLOBAL_FAIL_WINDOW if now - t < 10]
+        fail_count = len(_GLOBAL_FAIL_WINDOW)
+    if fail_count >= _GLOBAL_FAIL_THRESHOLD:
+        with _GLOBAL_COOLDOWN_LOCK:
+            _GLOBAL_COOLDOWN = time.time() + _GLOBAL_COOLDOWN_SECONDS
+        log(f"[GLOBAL] ⚠ 最近 {fail_count} 次失败，触发 {_GLOBAL_COOLDOWN_SECONDS}s 全局冷却")
+
+def _record_success():
+    """成功时清空失败窗口。"""
+    with _GLOBAL_FAIL_WINDOW_LOCK:
+        _GLOBAL_FAIL_WINDOW.clear()
 
 # 菜鸟公开 API
 PUBLIC_API_URL = "https://global.cainiao.com/global/detail.json"
 
 # 日志输出（WPS 请求时需要静默运行，日志写入文件可选）
-LOG_FILE = None  # 设置路径即可启用日志文件
+LOG_FILE = "cainiao_query.log"  # 每次请求的详细信息会写入此文件
 
 # ============================================================
 # Google Sheets 配置（留空则不启用）
@@ -148,6 +191,35 @@ _PLAYWRIGHT_READY_EVENT = threading.Event()
 # Playwright → curl_cffi Cookie 注入
 _PLAYWRIGHT_COOKIES = []
 _PLAYWRIGHT_COOKIES_LOCK = threading.Lock()
+# Playwright 是否可用（只检测一次，避免重复启动失败）
+_PLAYWRIGHT_AVAILABLE: Optional[bool] = None
+
+def _check_playwright_available() -> bool:
+    """快速检测 Playwright 是否可用（只检测一次并缓存结果）。"""
+    global _PLAYWRIGHT_AVAILABLE
+    if _PLAYWRIGHT_AVAILABLE is not None:
+        return _PLAYWRIGHT_AVAILABLE
+    try:
+        import playwright.sync_api  # noqa
+        # 还要检查浏览器是否真的安装
+        import subprocess
+        import shutil
+        # 查找 chromium 可执行路径
+        pw_browsers = os.path.expanduser("~/.cache/ms-playwright")
+        if not os.path.isdir(pw_browsers):
+            # 也可能在容器标准路径
+            if shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome"):
+                _PLAYWRIGHT_AVAILABLE = True
+                return True
+            _PLAYWRIGHT_AVAILABLE = False
+            log("[WARN] Playwright 浏览器未安装，跳过 Playwright 降级路径")
+            return False
+        _PLAYWRIGHT_AVAILABLE = True
+        return True
+    except ImportError:
+        _PLAYWRIGHT_AVAILABLE = False
+        log("[WARN] Playwright 未安装，跳过 Playwright 降级路径")
+        return False
 
 def _inject_playwright_cookies():
     """将 Playwright 浏览器中提取的 cookies 注入到 curl_cffi Session，降低触发滑块概率。"""
@@ -438,31 +510,71 @@ def _playwright_query(mail_no: str, lang: str = "zh-CN") -> dict:
 
 
 # ============================================================
-# 方案 B：requests（传统直连，降级用）
+# 方案 B：curl_cffi Session（带自动轮换）
 # ============================================================
-_CAINIAO_SESSION = requests.Session()
-_CAINIAO_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Referer": "https://global.cainiao.com/",
-    "Origin": "https://global.cainiao.com",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "DNT": "1",
-    "Connection": "keep-alive",
-})
-# 首次访问首页获取必要 cookies
-try:
-    _CAINIAO_SESSION.get(
-        "https://global.cainiao.com/",
-        proxies={"http": "", "https": ""},
-        verify=False,
-        timeout=10,
-    )
-except Exception:
-    pass
+# 使用全局 Session，但当检测到持续限流时自动创建新 Session 并轮换 User-Agent。
+# 避免单个 Session 被上游标记后所有请求持续失败。
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+# 连续限流计数器（达到阈值后触发 Session 轮换）
+_session_rl_count = 0
+_SESSION_RL_THRESHOLD = 2        # 连续 2 次限流就换 Session
+_session_lock = threading.Lock()
+
+def _build_session() -> requests.Session:
+    """创建全新的 curl_cffi Session，带随机 User-Agent 并预热首页。"""
+    s = requests.Session()
+    ua = random.choice(_USER_AGENTS)
+    s.headers.update({
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://global.cainiao.com/",
+        "Origin": "https://global.cainiao.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "DNT": "1",
+        "Connection": "keep-alive",
+    })
+    # 预热：访问首页获取 Cookie
+    try:
+        s.get(
+            "https://global.cainiao.com/",
+            proxies={"http": "", "https": ""},
+            verify=False,
+            timeout=15,
+        )
+    except Exception:
+        pass
+    return s
+
+
+def _maybe_rotate_session():
+    """当连续限流超过阈值时，创建一个全新的 Session 替换全局变量。"""
+    global _CAINIAO_SESSION, _session_rl_count
+    with _session_lock:
+        if _session_rl_count >= _SESSION_RL_THRESHOLD:
+            old = _CAINIAO_SESSION
+            _CAINIAO_SESSION = _build_session()
+            _session_rl_count = 0
+            log(f"[SESSION] 限流累计{_SESSION_RL_THRESHOLD}次，已轮换 Session（User-Agent: {_CAINIAO_SESSION.headers.get('User-Agent','')[:50]}…）")
+            try:
+                old.close()
+            except Exception:
+                pass
+            return True
+    return False
+
+
+_CAINIAO_SESSION = _build_session()
 
 
 def log(msg: str):
@@ -488,8 +600,71 @@ def log(msg: str):
             pass
 
 
+# ============================================================
+# 结果缓存（LRU + TTL，避免短时间重复查询触发限流）
+# ============================================================
+_CACHE_MAX_SIZE = 100          # 最多缓存 100 条
+_CACHE_TTL = 120               # 缓存有效期（秒）
+_QUERY_CACHE = {}              # key -> (timestamp, result)
+_QUERY_CACHE_ORDER = []        # 用于 LRU 淘汰的 key 列表
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    """从缓存读取，命中则刷新 LRU 顺序。"""
+    entry = _QUERY_CACHE.get(key)
+    if entry is None:
+        re全局冷却检查（短时间失败太多时强制定速） ---
+    _check_global_cooldown()
+
+    # --- turn None
+    ts, result = entry
+    if time.time() - ts > _CACHE_TTL:
+        # 过期
+        del _QUERY_CACHE[key]
+        try:
+            _QUERY_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+        return None
+    # 刷新 LRU
+    try:
+        _QUERY_CACHE_ORDER.remove(key)
+    except ValueError:
+        pass
+    _QUERY_CACHE_ORDER.append(key)
+    return result
+
+
+def _cache_set(key: str, result: dict):
+    """写入缓存，超出最大容量时淘汰最久未命中的条目。"""
+    # 若已存在，先清理旧位置
+    if key in _QUERY_CACHE:
+        try:
+            _QUERY_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+    # 淘汰
+    while len(_QUERY_CACHE) >= _CACHE_MAX_SIZE:
+        oldest = _QUERY_CACHE_ORDER.pop(0) if _QUERY_CACHE_ORDER else None
+        if oldest and oldest in _QUERY_CACHE:
+            del _QUERY_CACHE[oldest]
+        else:
+            break
+    _QUERY_CACHE[key] = (time.time(), result)
+    _QUERY_CACHE_ORDER.append(key)
+
+
 def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
     """查询菜鸟物流轨迹，使用 curl_cffi 直连（TLS 指纹模拟浏览器）。"""
+    # --- 缓存检查：同一运单号短时间内不重复查上游 ---
+    cache_key = f"{mail_no}:{lang}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        log(f"[CACHE] {mail_no} 命中缓存，直接返回")
+        _req_ctx.cache_hit = True
+        return cached
+    _req_ctx.cache_hit = False
+
     # 每次查询前随机延时，模仿人类的操作间隔
     delay = random.uniform(QUERY_DELAY_MIN, QUERY_DELAY_MAX)
     log(f"[SLEEP] {mail_no} 等待 {delay:.1f}s…")
@@ -501,7 +676,7 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
     # --- 方案 A：curl_cffi（TLS 指纹模拟浏览器，速度快） ---
     proxies = {"http": "", "https": ""}
     max_retries = 3
-    max_rate_limit = 1
+    max_rate_limit = 5          # 批量场景给更多限流重试机会
     normal_attempt = 0
     rate_limit_attempt = 0
     last_exc = None
@@ -509,6 +684,9 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
     try:
         while normal_attempt < max_retries:
             try:
+                # 在每次重试前检查是否需要轮换 Session（避免持续限流）
+                _maybe_rotate_session()
+
                 resp = _CAINIAO_SESSION.get(
                     PUBLIC_API_URL,
                     params={"mailNos": mail_no, "lang": lang},
@@ -538,6 +716,9 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                     is_rate_limited = "RGV587_ERROR" in err_text or "被挤爆" in err_text
                     if is_rate_limited:
                         rate_limit_attempt += 1
+                        # 累计连续限流，准备触发 Session 轮换
+                        with _session_lock:
+                            _session_rl_count += 1
                         if rate_limit_attempt > max_rate_limit:
                             raise RuntimeError(f"上游持续限流，已重试{max_rate_limit}次仍失败")
                         log(f"[RLIMIT] {mail_no} 上游限流 {_rl_count_str(rate_limit_attempt)}，尝试解除封锁…")
@@ -550,6 +731,7 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                                 _CAINIAO_SESSION.get(
                                     punish_url,
                                     proxies=proxies,
+                _record_success()
                                     verify=False,
                                     timeout=10,
                                 )
@@ -572,9 +754,14 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                         rl_delays = [3, 5, 15, 30, 45, 60]
                         idx = min(rate_limit_attempt - 1, len(rl_delays) - 1)
                         rl_delay = rl_delays[idx]
-                        log(f"[COOLDOWN] {mail_no} 等待 {rl_delay}s 冷却…")
+                        # 加入随机抖动 ±25%，避免所有客户端同时重试
+                        rl_delay *= random.uniform(0.75, 1.25)
+                        log(f"[COOLDOWN] {mail_no} 等待 {rl_delay:.0f}s 冷却…")
                         time.sleep(rl_delay)
+                        # 冷却后轮换 Session（如果已累计到阈值）
+                        _maybe_rotate_session()
                         continue  # 不计入普通重试
+        _record_failure()
 
                     normal_attempt += 1
                     if normal_attempt < max_retries:
@@ -584,6 +771,11 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                         continue
                     raise RuntimeError(f"API返回异常: {err_text[:200]}")
 
+                # 写入缓存，避免短时间重复查询
+                _cache_set(cache_key, body)
+                # 查询成功 → 重置连续限流计数器
+                with _session_lock:
+                    _session_rl_count = 0
                 return body
 
             except json.JSONDecodeError as e:
@@ -616,12 +808,14 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
         log(f"[WARN] curl_cffi 所有重试均失败: {e}")
 
     # --- 方案 B：Playwright（真实浏览器，绕过滑块验证） ---
-    if USE_PLAYWRIGHT:
+    if USE_PLAYWRIGHT and _check_playwright_available():
         log(f"[FALLBACK] 尝试 Playwright 绕过 CAPTCHA 查询 {mail_no}…")
         try:
             raw = _playwright_query(mail_no, lang)
             if raw and raw.get("success") is not False:
                 log(f"[OK] Playwright 成功查询 {mail_no}")
+                _cache_set(cache_key, raw)
+    _record_failure()
                 return raw
             log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
         except Exception as pw_e:
@@ -694,6 +888,7 @@ class QueryHandler(BaseHTTPRequestHandler):
 
     def _handle_get(self):
         parsed = urlparse(self.path)
+        req_start = time.time()
 
         if parsed.path == "/query":
             params = parse_qs(parsed.query)
@@ -702,18 +897,19 @@ class QueryHandler(BaseHTTPRequestHandler):
 
             if not mail_nos:
                 self._write_json(400, {"error": "缺少参数 ?mailNo=xxx"})
+                log(f"[REQ] 400 缺少参数")
                 return
 
             # 支持批量，用逗号分隔
             mail_no_list = [m.strip() for m in mail_nos[0].split(",") if m.strip()]
-
-            # 合并所有单号为逗号分隔字符串，一次 API 调用（官网 detail.json 原生支持）
             mail_no_str = ",".join(mail_no_list)
+            log(f"[REQ] → {', '.join(mail_no_list)} (共{len(mail_no_list)}单)")
+
             try:
                 raw = query_cainiao(mail_no_str, lang)
-                # parse_simplified 内部遍历 module[]（本身就是 list）
                 simplified = parse_simplified(raw)
-                log(f"[OK] 批量 {len(mail_no_list)} 单 → {len(simplified)} 结果")
+                elapsed = time.time() - req_start
+                log(f"[OK] ✓ {len(mail_no_list)}单 耗时{elapsed:.1f}s → {len(simplified)}结果")
                 # 补齐缺失的单号（API 不会为无效单号返回 module 项）
                 returned_mail_nos = {r["mailNo"] for r in simplified}
                 for mn in mail_no_list:
@@ -733,7 +929,8 @@ class QueryHandler(BaseHTTPRequestHandler):
                 _write_results_to_sheet(simplified)
                 self._write_json(200, {"code": 0, "data": simplified})
             except Exception as e:
-                log(f"[ERR] 批量查询失败: {e}")
+                elapsed = time.time() - req_start
+                log(f"[ERR] ✗ {mail_no_str} 耗时{elapsed:.1f}s → {e}")
                 # 全部标记为失败
                 err_results = []
                 for mn in mail_no_list:
@@ -785,6 +982,12 @@ class QueryHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Content-Length", str(len(body)))
+            # 缓存状态
+            cache_hit = getattr(_req_ctx, "cache_hit", None)
+            if cache_hit is True:
+                self.send_header("X-Cache", "HIT")
+            elif cache_hit is False:
+                self.send_header("X-Cache", "MISS")
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
