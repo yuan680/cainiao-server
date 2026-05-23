@@ -12,13 +12,6 @@ config.json
 *.sh
 *.csv
 *.log
-*.txt
-!requirements.txt
-*.ps1
-*.sh
-*.csv
-*.log
-*.txt
 
 # 构建产物
 build/
