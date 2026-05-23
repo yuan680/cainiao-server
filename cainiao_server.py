@@ -111,8 +111,10 @@ from curl_cffi import requests
 USE_PLAYWRIGHT = True
 # 每次查询前的随机延时范围（秒），加入更大抖动模拟人类操作
 # 批量场景下：0.8-1.5s 太规律，放大到 1.0-3.0s 更不容易触发限流
-QUERY_DELAY_MIN = 1.0
-QUERY_DELAY_MAX = 3.0
+# 2026-05-23 优化：配合 WPS 批量请求模式（单 HTTP 含多单号），
+# 延迟减半（0.5-1.5s），每批只等一次，整体速度翻倍。
+QUERY_DELAY_MIN = 0.5
+QUERY_DELAY_MAX = 1.5
 
 # 全局冷却：当短时间内失败太多时，强制所有查询等待
 _GLOBAL_COOLDOWN = 0.0          # 下次查询前需等待的时间戳（time.time）
@@ -603,8 +605,8 @@ def log(msg: str):
 # ============================================================
 # 结果缓存（LRU + TTL，避免短时间重复查询触发限流）
 # ============================================================
-_CACHE_MAX_SIZE = 100          # 最多缓存 100 条
-_CACHE_TTL = 120               # 缓存有效期（秒）
+_CACHE_MAX_SIZE = 200          # 最多缓存 200 条
+_CACHE_TTL = 300               # 缓存有效期（秒），5 分钟内重复查同一单号直接从缓存返回
 _QUERY_CACHE = {}              # key -> (timestamp, result)
 _QUERY_CACHE_ORDER = []        # 用于 LRU 淘汰的 key 列表
 
