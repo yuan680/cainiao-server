@@ -606,8 +606,18 @@ def log(msg: str):
 # 结果缓存（LRU + TTL，避免短时间重复查询触发限流）
 # ============================================================
 _CACHE_MAX_SIZE = 200          # 最多缓存 200 条
-_CACHE_TTL = 300               # 缓存有效期（秒），5 分钟内重复查同一单号直接从缓存返回
-_QUERY_CACHE = {}              # key -> (timestamp, result)
+_CACHE_TTL = 300               # 缓存有效期（秒），仅终态单号缓存 5 分钟
+_QUERY_CACHE = {}              # key -> (expiry_timestamp, result)
+
+# 终态状态码——到达这些状态后物流信息不会再变化，可安全缓存较长时间
+# 非终态（运输中、清关中、派送中）一律不缓存，确保 WPS 每次查询都拿到最新状态
+_TERMINAL_STATUS_CODES = frozenset({
+    "DELIVERED",        # 妥投 / 用户已签收
+    "FAILED",           # 投递失败 / 异常
+    "RETURNED",         # 退件
+    "CANCELLED",        # 已取消
+    "LOST",             # 遗失
+})
 _QUERY_CACHE_ORDER = []        # 用于 LRU 淘汰的 key 列表
 
 
@@ -616,8 +626,8 @@ def _cache_get(key: str) -> Optional[dict]:
     entry = _QUERY_CACHE.get(key)
     if entry is None:
         return None
-    ts, result = entry
-    if time.time() - ts > _CACHE_TTL:
+    expiry, result = entry
+    if time.time() > expiry:
         # 过期
         del _QUERY_CACHE[key]
         try:
@@ -634,8 +644,20 @@ def _cache_get(key: str) -> Optional[dict]:
     return result
 
 
-def _cache_set(key: str, result: dict):
-    """写入缓存，超出最大容量时淘汰最久未命中的条目。"""
+def _cache_set(key: str, result: dict, ttl: Optional[int] = None):
+    """写入缓存，超出最大容量时淘汰最久未命中的条目。
+
+    Args:
+        key: 缓存键
+        result: 缓存值
+        ttl: 此条目的有效时长（秒）。None 表示使用全局 _CACHE_TTL。
+             传入 0 或负数则跳过缓存。
+    """
+    if ttl is None:
+        ttl = _CACHE_TTL
+    if ttl <= 0:
+        return  # 不缓存非终态数据，确保 WPS 每次查询拿到最新状态
+    expiry = time.time() + ttl
     # 若已存在，先清理旧位置
     if key in _QUERY_CACHE:
         try:
@@ -649,8 +671,30 @@ def _cache_set(key: str, result: dict):
             del _QUERY_CACHE[oldest]
         else:
             break
-    _QUERY_CACHE[key] = (time.time(), result)
+    _QUERY_CACHE[key] = (expiry, result)
     _QUERY_CACHE_ORDER.append(key)
+
+
+def _resolve_cache_ttl(api_response: dict) -> int:
+    """根据 API 响应中所有包裹的物流状态决定缓存时长。
+
+    终态（DELIVERED / FAILED / RETURNED / CANCELLED / LOST）不会再变化，
+    可安全缓存满 _CACHE_TTL；非终态（运输中、清关中等）不缓存，
+    确保 WPS 每次查询都拿到最新状态。
+
+    Returns:
+        _CACHE_TTL（全量缓存时长）或 0（不缓存）。
+    """
+    module = api_response.get("module")
+    if not isinstance(module, list):
+        return 0                     # 无有效数据，不缓存
+    # 仅在所有包裹均为终态时缓存
+    if all(
+        isinstance(item, dict) and item.get("status", "") in _TERMINAL_STATUS_CODES
+        for item in module
+    ):
+        return _CACHE_TTL
+    return 0                         # 有任何一单仍在运输中 → 不缓存
 
 
 def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
@@ -768,8 +812,8 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                         continue
                     raise RuntimeError(f"API返回异常: {err_text[:200]}")
 
-                # 写入缓存，避免短时间重复查询
-                _cache_set(cache_key, body)
+                # 判断是否所有包裹都已达到终态，决定缓存时长
+                _cache_set(cache_key, body, ttl=_resolve_cache_ttl(body))
                 # 查询成功 → 重置连续限流计数器
                 with _session_lock:
                     _session_rl_count = 0
@@ -811,7 +855,7 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
             raw = _playwright_query(mail_no, lang)
             if raw and raw.get("success") is not False:
                 log(f"[OK] Playwright 成功查询 {mail_no}")
-                _cache_set(cache_key, raw)
+                _cache_set(cache_key, raw, ttl=_resolve_cache_ttl(raw))
                 return raw
             log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
         except Exception as pw_e:
