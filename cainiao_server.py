@@ -37,6 +37,63 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from typing import Optional
 
+# ============================================================
+# Google Sheets 写入（可选懒加载）
+# ============================================================
+_GSHEET_WRITER = None
+_GSHEET_READY = False
+
+
+def _get_gsheet_writer():
+    """懒加载 Google Sheets 写入器。"""
+    global _GSHEET_WRITER, _GSHEET_READY
+    if _GSHEET_READY:
+        return _GSHEET_WRITER
+    if not GOOGLE_SHEET_ID:
+        _GSHEET_READY = True
+        return None
+    try:
+        from gsheet_writer import GoogleSheetsWriter
+        _GSHEET_WRITER = GoogleSheetsWriter(creds_path=GOOGLE_SHEET_CREDENTIALS)
+        _GSHEET_WRITER.set_sheet(GOOGLE_SHEET_ID, GOOGLE_SHEET_WORKSHEET)
+        _GSHEET_READY = True
+        log(f"[GSHEET] Google Sheets 写入已启用 (Sheet: {GOOGLE_SHEET_ID})")
+    except Exception as e:
+        log(f"[GSHEET] 初始化失败: {e}（不影响查询功能）")
+        _GSHEET_READY = True
+    return _GSHEET_WRITER
+
+
+def _write_results_to_sheet(results: list[dict]):
+    """将查询结果异步写入 Google Sheets。"""
+    import threading
+    threading.Thread(target=_do_write_sheet, args=(results,), daemon=True).start()
+
+
+def _do_write_sheet(results: list[dict]):
+    """后台线程：实际写入。"""
+    writer = _get_gsheet_writer()
+    if writer is None:
+        return
+    header = [
+        "mailNo", "status", "statusCode", "origin", "dest",
+        "latestTime", "latestEvent", "eventCount",
+    ]
+    rows = []
+    for r in results:
+        rows.append([
+            r.get("mailNo", ""),
+            r.get("status", ""),
+            r.get("statusCode", ""),
+            r.get("origin", ""),
+            r.get("dest", ""),
+            r.get("latestTime", ""),
+            r.get("latestEvent", ""),
+            str(r.get("eventCount", 0)),
+        ])
+    writer.ensure_header(header)
+    writer.write_rows(rows)
+
 from curl_cffi import requests
 
 # curl_cffi 自带 TLS 指纹模拟，无需额外 SSL 警告压制
@@ -59,6 +116,19 @@ PUBLIC_API_URL = "https://global.cainiao.com/global/detail.json"
 
 # 日志输出（WPS 请求时需要静默运行，日志写入文件可选）
 LOG_FILE = None  # 设置路径即可启用日志文件
+
+# ============================================================
+# Google Sheets 配置（留空则不启用）
+# ============================================================
+# Sheet ID: 从 Google Sheets URL 获取
+#   https://docs.google.com/spreadsheets/d/【HERE】/edit
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+
+# 证书文件路径（环境变量优先，支持服务账号 JSON / OAuth token JSON）
+GOOGLE_SHEET_CREDENTIALS = os.environ.get("GOOGLE_SHEET_CREDENTIALS", "")
+
+# 工作表名称（默认第一个 tab）
+GOOGLE_SHEET_WORKSHEET = os.environ.get("GOOGLE_SHEET_WORKSHEET", "Sheet1")
 
 # ============================================================
 # 方案 A：Playwright（真实 Chromium 浏览器）— 专用工作线程
@@ -654,6 +724,8 @@ class QueryHandler(BaseHTTPRequestHandler):
                             "eventCount": 0,
                             "error": "",
                         })
+                # 异步写入 Google Sheets（如果已配置）
+                _write_results_to_sheet(simplified)
                 self._write_json(200, {"code": 0, "data": simplified})
             except Exception as e:
                 log(f"[ERR] 批量查询失败: {e}")

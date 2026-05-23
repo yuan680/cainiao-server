@@ -1,0 +1,35 @@
+# ════════════════════════════════════════════════════════════
+# 菜鸟物流查询 — Render Blueprint 部署配置
+# ════════════════════════════════════════════════════════════
+services:
+  # Web Service：菜鸟物流追踪 API
+  - type: web
+    name: cainiao-server
+    runtime: docker
+    repo: https://github.com/yuan680/cainiao-server.git
+    region: hongkong  # 新加坡或香港，离中国近延迟低
+    plan: free        # 免费计划：512MB RAM / 1 vCPU
+
+    branch: master
+    dockerfilePath: ./Dockerfile
+
+    # 健康检查路径（Render 自动轮询）
+    healthCheckPath: /health
+
+    # 环境变量
+    envVars:
+      - key: PORT
+        value: 58080
+      - key: USE_PLAYWRIGHT
+        value: "true"
+      - key: PW_HEADLESS
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: TZ
+        value: Asia/Shanghai
+
+    # 自动缩放 — 免费计划始终 1 实例
+    scaling:
+      minInstances: 1
+      maxInstances: 1

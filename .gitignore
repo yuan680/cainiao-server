@@ -8,9 +8,7 @@ dist/
 
 # Logs
 *.log
-*.txt
 server_*.log
-server_*.txt
 
 # Executables
 *.exe
