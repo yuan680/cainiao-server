@@ -46,6 +46,8 @@ from curl_cffi import requests
 # ============================================================
 # 直接使用 curl_cffi（TLS 指纹模拟浏览器），速度最快
 # Playwright 作为 curl_cffi 限流时的降级方案（页面导航模式）
+# 云部署（Cloud Run / Docker）内置 Playwright 基镜像，可用浏览器兜底
+# curl_cffi 优先，限流时降级到 Playwright（1GB RAM 足够跑 Chromium）
 USE_PLAYWRIGHT = True
 # 每次查询前的随机延时范围（秒），避免触发风控
 # 串行查询时 0.5~1.5s/个，真人操作节奏
@@ -726,8 +728,10 @@ def main():
     # Render 云部署会自动设置 PORT 环境变量
     default_port = int(os.environ.get("PORT", 58080))
     default_host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
-    parser.add_argument("--port", type=int, default=default_port, help="监听端口（默认 58080，云部署自动取 PORT 环境变量）")
-    parser.add_argument("--host", default=default_host, help="监听地址（云部署默认 0.0.0.0）")
+    parser.add_argument("--port", type=int, default=default_port,
+                        help="监听端口（默认 58080，Cloud Run 自动取 PORT 环境变量）")
+    parser.add_argument("--host", default=default_host,
+                        help="监听地址（Cloud Run 默认 0.0.0.0，本地默认 127.0.0.1）")
     parser.add_argument("--log-file", default=None, help="日志文件路径（可选）")
     args = parser.parse_args()
 
@@ -753,7 +757,7 @@ def main():
     print(f"[INFO] http://{args.host}:{args.port}")
     print(f"[INFO] 查询示例: http://localhost:{args.port}/query?mailNo=LP00812637173551")
     if "PORT" in os.environ:
-        print(f"[INFO] 云部署模式，服务 URL 以 Render 分配为准")
+        print(f"[INFO] 云部署模式（Cloud Run），服务 URL 以分配为准")
     print(f"[INFO] 按 Ctrl+C 停止")
     print()
 
