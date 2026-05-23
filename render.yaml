@@ -20,9 +20,9 @@ services:
     envVars:
       - key: PORT
         value: 58080
+      - key: CHROMIUM_FLAGS
+        value: "--no-sandbox --disable-dev-shm-usage --single-process --disable-gpu --no-zygote --js-flags=--max_old_space_size=256"
       - key: USE_PLAYWRIGHT
-        value: "true"
-      - key: PW_HEADLESS
         value: "true"
       - key: LOG_LEVEL
         value: INFO
@@ -33,3 +33,22 @@ services:
     scaling:
       minInstances: 1
       maxInstances: 1
+
+  # ──────────────────────────────────────────────
+  # Cron Job：定时执行（例如每 5 分钟查询一次）
+  # 需搭配 cainiao_server.py 的批量查询接口使用
+  # ──────────────────────────────────────────────
+  # - type: cron
+  #   name: cainiao-track-cron
+  #   runtime: docker
+  #   repo: https://github.com/yuan680/cainiao-server.git
+  #   region: hongkong
+  #   plan: free
+  #   branch: master
+  #   dockerfilePath: ./Dockerfile
+  #   schedule: "*/5 * * * *"
+  #   envVars:
+  #     - key: PORT
+  #       value: 58080
+  #     - key: CHROMIUM_FLAGS
+  #       value: "--no-sandbox --disable-dev-shm-usage --single-process --disable-gpu --no-zygote --js-flags=--max_old_space_size=256"

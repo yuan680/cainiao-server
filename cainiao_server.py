@@ -178,7 +178,7 @@ def _playwright_worker():
         import platform as _platform
         from playwright.sync_api import sync_playwright
 
-        os.environ["PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL"] = "0"
+        os.environ.pop("PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL", None)
 
         # --- 根据操作系统调整浏览器参数 ---
         system = _platform.system()  # Windows / Darwin / Linux
@@ -187,6 +187,11 @@ def _playwright_worker():
         ]
         if system == "Linux":
             launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
+        # 从环境变量读取额外 Chromium 标志（Dockerfile 中设置，用于限制内存等）
+        _extra_flags = os.environ.get("CHROMIUM_FLAGS", "").strip()
+        if _extra_flags:
+            launch_args.extend(_extra_flags.split())
 
         # --- 选择对应的 User-Agent（让网站看到"真实"的浏览器环境）---
         if system == "Darwin":
