@@ -676,7 +676,7 @@ class QueryHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/":
             self._write_json(200, {
                 "server": "菜鸟物流查询本地服务",
-                "version": "1.0",
+                "version": "1.1",
                 "usage": "GET /query?mailNo=LP00812637173551",
                 "status": "running",
             })
