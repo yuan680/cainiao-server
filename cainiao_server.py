@@ -33,9 +33,10 @@ import random
 import threading
 import queue
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from datetime import datetime
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 每个 HTTP 请求的上下文（线程本地）
 _req_ctx = threading.local()
@@ -197,27 +198,43 @@ _PLAYWRIGHT_COOKIES_LOCK = threading.Lock()
 _PLAYWRIGHT_AVAILABLE: Optional[bool] = None
 
 def _check_playwright_available() -> bool:
-    """快速检测 Playwright 是否可用（只检测一次并缓存结果）。"""
+    """快速检测 Playwright 是否可用（只检测一次并缓存结果）。
+
+    兼容自定义 PLAYWRIGHT_BROWSERS_PATH（Render Dockerfile 设为 /app/pw-browsers）。
+    """
     global _PLAYWRIGHT_AVAILABLE
     if _PLAYWRIGHT_AVAILABLE is not None:
         return _PLAYWRIGHT_AVAILABLE
     try:
         import playwright.sync_api  # noqa
-        # 还要检查浏览器是否真的安装
-        import subprocess
         import shutil
-        # 查找 chromium 可执行路径
-        pw_browsers = os.path.expanduser("~/.cache/ms-playwright")
-        if not os.path.isdir(pw_browsers):
-            # 也可能在容器标准路径
-            if shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome"):
-                _PLAYWRIGHT_AVAILABLE = True
-                return True
-            _PLAYWRIGHT_AVAILABLE = False
-            log("[WARN] Playwright 浏览器未安装，跳过 Playwright 降级路径")
-            return False
-        _PLAYWRIGHT_AVAILABLE = True
-        return True
+        # 查找可能的 Playwright 浏览器目录，优先使用环境变量
+        search_paths = set()
+        env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+        if env_path:
+            search_paths.add(env_path)
+        search_paths.add(os.path.expanduser("~/.cache/ms-playwright"))
+
+        for p in search_paths:
+            if not os.path.isdir(p):
+                continue
+            # 检查路径下是否含有 chromium 子目录（如 chromium-XXXX）
+            try:
+                for entry in os.listdir(p):
+                    if "chrom" in entry.lower() and os.path.isdir(os.path.join(p, entry)):
+                        _PLAYWRIGHT_AVAILABLE = True
+                        return True
+            except PermissionError:
+                continue
+
+        # 也检查系统命令（备用）
+        if shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome"):
+            _PLAYWRIGHT_AVAILABLE = True
+            return True
+
+        _PLAYWRIGHT_AVAILABLE = False
+        log("[WARN] Playwright 浏览器未安装，跳过 Playwright 降级路径")
+        return False
     except ImportError:
         _PLAYWRIGHT_AVAILABLE = False
         log("[WARN] Playwright 未安装，跳过 Playwright 降级路径")
@@ -723,6 +740,7 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
     normal_attempt = 0
     rate_limit_attempt = 0
     last_exc = None
+    _last_errors = []
 
     try:
         while normal_attempt < max_retries:
@@ -847,6 +865,7 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
             raise RuntimeError("curl_cffi 重试全部耗尽")
     except Exception as e:
         log(f"[WARN] curl_cffi 所有重试均失败: {e}")
+        _last_errors.append(f"[A] curl_cffi: {e}")
 
     # --- 方案 B：Playwright（真实浏览器，绕过滑块验证） ---
     if USE_PLAYWRIGHT and _check_playwright_available():
@@ -860,8 +879,49 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
             log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
         except Exception as pw_e:
             log(f"[FALLBACK] Playwright 也失败: {pw_e}")
+            _last_errors.append(f"[B] Playwright: {pw_e}")
 
-    raise RuntimeError(f"所有查询方案均失败: {mail_no}")
+    # --- 方案 C：标准 urllib（零依赖，完全不同 TLS 指纹，绕过 curl_cffi 特殊特征） ---
+    log(f"[FALLBACK] 尝试标准 urllib 查询 {mail_no}…")
+    try:
+        import ssl
+        import urllib.request
+
+        # 复用已有 cookies（纯 HTTP 头格式）
+        with _session_lock:
+            cj = _CAINIAO_SESSION.cookies
+            cookie_parts = [f"{c.name}={c.value}" for c in cj]
+        cookie_header = "; ".join(cookie_parts) if cookie_parts else ""
+
+        urllib_headers = {
+            "User-Agent": _UA,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://global.cainiao.com/global/detail.json?mailNo={mail_no}",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        if cookie_header:
+            urllib_headers["Cookie"] = cookie_header
+
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        req_url = f"{PUBLIC_API_URL}?mailNo={quote(mail_no)}&lang={lang}"
+        req = urllib.request.Request(req_url, headers=urllib_headers)
+
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            if body.get("success") is not False and body.get("module") is not None:
+                log(f"[OK] urllib 成功查询 {mail_no}")
+                _cache_set(cache_key, body, ttl=_resolve_cache_ttl(body))
+                return body
+            log(f"[WARN] urllib 返回异常: {json.dumps(body, ensure_ascii=False)[:200]}")
+    except Exception as ue:
+        log(f"[FALLBACK] urllib 也失败: {ue}")
+        _last_errors.append(f"[C] urllib: {ue}")
+
+    detail = " | ".join(_last_errors) if _last_errors else "全部查询方案均返回空"
+    raise RuntimeError(f"所有查询方案均失败 ({mail_no}): {detail}")
 
 
 def _rl_count_str(n: int) -> str:
@@ -945,16 +1005,38 @@ class QueryHandler(BaseHTTPRequestHandler):
             mail_no_str = ",".join(mail_no_list)
             log(f"[REQ] → {', '.join(mail_no_list)} (共{len(mail_no_list)}单)")
 
-            try:
-                raw = query_cainiao(mail_no_str, lang)
-                simplified = parse_simplified(raw)
-                elapsed = time.time() - req_start
-                log(f"[OK] ✓ {len(mail_no_list)}单 耗时{elapsed:.1f}s → {len(simplified)}结果")
-                # 补齐缺失的单号（API 不会为无效单号返回 module 项）
-                returned_mail_nos = {r["mailNo"] for r in simplified}
-                for mn in mail_no_list:
-                    if mn not in returned_mail_nos:
-                        simplified.append({
+            # 分批查询：上游 API 对大批量有限制（建议每批 ≤20），拆成多个子批次并发执行
+            SUB_BATCH_SIZE = 20
+
+            def _process_sub_batch(sub_batch: list[str]) -> list[dict]:
+                """查询单个子批次（20 单），返回 parse_simplified 结果。"""
+                sub_batch_local = []
+                sub_str = ",".join(sub_batch)
+                try:
+                    raw = query_cainiao(sub_str, lang)
+                    parsed = parse_simplified(raw)
+                    sub_batch_local.extend(parsed)
+                    returned_mns = {r["mailNo"] for r in parsed}
+
+                    # 对子批次内缺失的单号逐个补查
+                    for mn in sub_batch:
+                        if mn not in returned_mns:
+                            log(f"[RETRY] 批查未返回，单独补查: {mn}")
+                            try:
+                                ind_raw = query_cainiao(mn, lang)
+                                ind_parsed = parse_simplified(ind_raw)
+                                if ind_parsed:
+                                    sub_batch_local.append(ind_parsed[0])
+                                    returned_mns.add(mn)
+                                    log(f"[RETRY] ✓ {mn} 补查成功: {ind_parsed[0].get('status','')}")
+                            except Exception as ind_e:
+                                log(f"[RETRY] ✗ {mn} 补查失败: {ind_e}")
+
+                    # 仍缺失的 → 标记无数据
+                    still_missing = [mn for mn in sub_batch
+                                     if mn not in {r["mailNo"] for r in sub_batch_local}]
+                    for mn in still_missing:
+                        sub_batch_local.append({
                             "mailNo": mn,
                             "status": "无数据",
                             "statusCode": "",
@@ -965,27 +1047,52 @@ class QueryHandler(BaseHTTPRequestHandler):
                             "eventCount": 0,
                             "error": "",
                         })
-                # 异步写入 Google Sheets（如果已配置）
-                _write_results_to_sheet(simplified)
-                self._write_json(200, {"code": 0, "data": simplified})
-            except Exception as e:
-                elapsed = time.time() - req_start
-                log(f"[ERR] ✗ {mail_no_str} 耗时{elapsed:.1f}s → {e}")
-                # 全部标记为失败
-                err_results = []
-                for mn in mail_no_list:
-                    err_results.append({
-                        "mailNo": mn,
-                        "status": "查询失败",
-                        "statusCode": "",
-                        "origin": "",
-                        "dest": "",
-                        "latestTime": "",
-                        "latestEvent": "",
-                        "eventCount": 0,
-                        "error": str(e),
-                    })
-                self._write_json(200, {"code": 0, "data": err_results})
+                except Exception as sub_e:
+                    err_msg = str(sub_e)
+                    log(f"[SUB-ERR] 子批次 {','.join(sub_batch)} 失败: {err_msg}")
+                    for mn in sub_batch:
+                        sub_batch_local.append({
+                            "mailNo": mn,
+                            "status": "查询失败",
+                            "statusCode": "",
+                            "origin": "",
+                            "dest": "",
+                            "latestTime": "",
+                            "latestEvent": "",
+                            "eventCount": 0,
+                            "error": err_msg,
+                        })
+                return sub_batch_local
+
+            # 将连续的子批次提交到线程池并发执行（最多 4 个 worker）
+            # 独立 mailNo 之间无竞态，且能大幅减少总耗时
+            all_simplified = []
+            batch_errors = {}
+            max_parallel = min(4, (len(mail_no_list) + SUB_BATCH_SIZE - 1) // SUB_BATCH_SIZE)
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                futures = []
+                for b_idx in range(0, len(mail_no_list), SUB_BATCH_SIZE):
+                    sub_batch = mail_no_list[b_idx:b_idx + SUB_BATCH_SIZE]
+                    future = executor.submit(_process_sub_batch, sub_batch)
+                    futures.append(future)
+
+                for future in as_completed(futures):
+                    try:
+                        all_simplified.extend(future.result())
+                    except Exception as e:
+                        log(f"[PARALLEL] 子批次异常: {e}")
+
+            # 统计失败
+            for entry in all_simplified:
+                if entry.get("error"):
+                    batch_errors[entry["mailNo"]] = entry["error"]
+
+            elapsed_total = time.time() - req_start
+            success_count = len(all_simplified) - len(batch_errors)
+            log(f"[OK] ✓ {len(mail_no_list)}单完成 耗时{elapsed_total:.1f}s (成功{success_count} 失败{len(batch_errors)})")
+            # 异步写入 Google Sheets（如果已配置）
+            _write_results_to_sheet(all_simplified)
+            self._write_json(200, {"code": 0, "data": all_simplified})
 
         elif parsed.path == "/":
             self._write_json(200, {
@@ -1071,7 +1178,7 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), QueryHandler)
     print(f"[CAINIAO] 菜鸟物流查询服务已启动")
     print(f"[INFO] 操作系统: {_sys}")
-    print(f"[INFO] Playwright: {'✓ 已安装' if _pw_available else '✗ 未安装（仅使用 curl_cffi 直连，遇见滑块验证会报错）'}")
+    print(f"[INFO] Playwright: {'[OK] 已安装' if _pw_available else '[NO] 未安装（仅使用 curl_cffi 直连，遇见滑块验证会报错）'}")
     if not _pw_available:
         print(f"[HINT] 如需绕过滑块验证，运行: pip install playwright && playwright install chromium")
     print(f"[INFO] http://{args.host}:{args.port}")
