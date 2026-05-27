@@ -716,6 +716,7 @@ def _resolve_cache_ttl(api_response: dict) -> int:
 
 def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
     """查询菜鸟物流轨迹，使用 curl_cffi 直连（TLS 指纹模拟浏览器）。"""
+    global _session_rl_count
     # --- 缓存检查：同一运单号短时间内不重复查上游 ---
     cache_key = f"{mail_no}:{lang}"
     cached = _cache_get(cache_key)
@@ -890,11 +891,17 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
         # 复用已有 cookies（纯 HTTP 头格式）
         with _session_lock:
             cj = _CAINIAO_SESSION.cookies
-            cookie_parts = [f"{c.name}={c.value}" for c in cj]
+            if hasattr(cj, 'get_dict'):
+                cookie_dict = cj.get_dict()
+                cookie_parts = [f"{k}={v}" for k, v in cookie_dict.items()]
+            elif isinstance(cj, dict):
+                cookie_parts = [f"{k}={v}" for k, v in cj.items()]
+            else:
+                cookie_parts = []
         cookie_header = "; ".join(cookie_parts) if cookie_parts else ""
 
         urllib_headers = {
-            "User-Agent": _UA,
+            "User-Agent": random.choice(_USER_AGENTS),
             "Accept": "application/json, text/plain, */*",
             "Referer": f"https://global.cainiao.com/global/detail.json?mailNo={mail_no}",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
