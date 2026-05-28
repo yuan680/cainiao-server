@@ -33,8 +33,8 @@ var HEADER_NAMES = {
 var FINAL_STATUSES = ["妥投", "成功签收"];
 
 var BATCH_SIZE = 100;           // 每组处理行数（写入+查询，与SUB_BATCH_SIZE对齐）
-var SUB_BATCH_SIZE = 20;        // ★ 每个HTTP请求查询几个单号（降为20，对齐服务端session轮换阈值，降低限流概率）
-var BETWEEN_REQUESTS_MS = 1200; // 请求间延迟基准值（实际使用 jitter，见 sleepBetweenSubBatches）
+var SUB_BATCH_SIZE = 3;         // ★ 每个HTTP请求查询几个单号（降为3，对齐服务端子批次，避免Render 50s超时）
+var BETWEEN_REQUESTS_MS = 800;  // 请求间延迟基准值（每批3单耗时短，延迟可适当降低）
 var MAX_RUN_TIME_MS = 4.5 * 60 * 1000;
 
 // ─── 工具函数 ───────────────────────────────────
@@ -69,7 +69,7 @@ function queryMailNos(mailNos) {
     var url = API_URL + "?mailNo=" + encodeURIComponent(mailNos.join(","));
     for (var r = 0; r < 5; r++) {
         try {
-            var resp = HTTP.get(url);
+            var resp = HTTP.get(url, {timeout: 120000});  // 120s超时，Render 免费版限 50s，增加余量
             if (resp) {
                 if (resp.status === 200) {
                     var text = resp.text();
@@ -135,7 +135,7 @@ function warmupServer() {
     for (var w = 0; w < 20; w++) {
         try {
             var url = API_URL + "?mailNo=" + testNos[0];
-            var resp = HTTP.get(url);
+            var resp = HTTP.get(url, {timeout: 120000});  // 预热也设120s超时
             if (resp && resp.status === 200) {
                 var text = resp.text();
                 if (text && text !== "" && text.indexOf("code") >= 0) {
