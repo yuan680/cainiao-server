@@ -846,7 +846,7 @@ class ProxyManager:
         self._failed: set[str] = set()
         self._last_fetch_time = 0
         self._fetch_interval = 300  # 5 分钟刷新免费代理
-        self._mode = os.environ.get("PROXY_MODE", "").lower().strip()
+        self._mode = os.environ.get("PROXY_MODE", "rotate").lower().strip()
         self._proxy_list_raw = os.environ.get("PROXY_LIST", "").strip()
         self._check_url = os.environ.get("PROXY_CHECK_URL", "https://global.cainiao.com/")
 
