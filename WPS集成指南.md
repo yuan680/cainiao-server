@@ -4,17 +4,19 @@
 
 ---
 
-## ⚠️ 关键限制：AirScript 无法调 localhost
+## ⚠️ 关键限制：AirScript 无法调 localhost（详见独立文档）
 
 WPS 多维表的「执行 AirScript 脚本」运行在**云端沙箱**，不能访问 `localhost`/`127.0.0.1`。
 - **按钮「执行 AirScript 脚本」** → 必须用公网 URL（已预置 `PUBLIC_URL`）
 - **按钮「发送 HTTP 请求」** ✅ 桌面端可访问本地服务，不受此限制
 
+> ❗ **JS 宏（AirScript）中写 localhost 永远无效**，不存在"失败后自动降级"的可能。
+> 详细分析见 [WPS_AirScript关键限制.md](WPS_AirScript关键限制.md)
+
 公网服务地址（已部署到 Render）：
 ```
 https://cainiao-server.onrender.com/query?mailNo=LP00812637173551
 ```
-脚本内置自动降级：先试本地 → 失败自动切公网。
 
 ---
 

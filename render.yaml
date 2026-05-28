@@ -26,6 +26,8 @@ services:
         value: "true"
       - key: LOG_LEVEL
         value: INFO
+      - key: PROXY_MODE
+        value: rotate
       - key: TZ
         value: Asia/Shanghai
 

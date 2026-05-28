@@ -188,7 +188,8 @@ _PLAYWRIGHT_TASK_QUEUE = queue.Queue()   # (task_id, mail_no, lang)
 _PLAYWRIGHT_RESULTS = {}                 # task_id -> dict | Exception
 _PLAYWRIGHT_EVENTS = {}                  # task_id -> threading.Event
 _PLAYWRIGHT_COUNTER = 0
-_PLAYWRIGHT_THREAD: Optional[threading.Thread] = None
+_PLAYWRIGHT_NUM_WORKERS = 3              # 并发 Worker 数量，每个拥有独立浏览器+页面
+_PLAYWRIGHT_WORKER_THREADS: list[threading.Thread] = []
 _PLAYWRIGHT_READY_EVENT = threading.Event()
 
 # Playwright → curl_cffi Cookie 注入
@@ -214,6 +215,10 @@ def _check_playwright_available() -> bool:
         if env_path:
             search_paths.add(env_path)
         search_paths.add(os.path.expanduser("~/.cache/ms-playwright"))
+        # Windows: %USERPROFILE%\AppData\Local\ms-playwright
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            search_paths.add(os.path.join(local_app_data, "ms-playwright"))
 
         for p in search_paths:
             if not os.path.isdir(p):
@@ -263,8 +268,12 @@ def _inject_playwright_cookies():
         log(f"[COOKIE] 已将 {count} 个 Playwright Cookie 注入 curl_cffi Session")
 
 
-def _playwright_worker():
-    """Playwright 工作线程：页面导航→监听 API 响应，自动降级解决滑块。"""
+def _playwright_worker(worker_id: int):
+    """Playwright 工作线程 #id：独立浏览器+页面，多 Worker 并发。
+
+    每个 Worker 拥有独立的浏览器实例、上下文、页面和事件监听器，
+    因此完全线程安全，共享同一任务队列 _PLAYWRIGHT_TASK_QUEUE。
+    """
     try:
         import platform as _platform
         from playwright.sync_api import sync_playwright
@@ -272,19 +281,18 @@ def _playwright_worker():
         os.environ.pop("PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL", None)
 
         # --- 根据操作系统调整浏览器参数 ---
-        system = _platform.system()  # Windows / Darwin / Linux
+        system = _platform.system()
         launch_args = [
             "--disable-blink-features=AutomationControlled",
         ]
         if system == "Linux":
             launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
 
-        # 从环境变量读取额外 Chromium 标志（Dockerfile 中设置，用于限制内存等）
         _extra_flags = os.environ.get("CHROMIUM_FLAGS", "").strip()
         if _extra_flags:
             launch_args.extend(_extra_flags.split())
 
-        # --- 选择对应的 User-Agent（让网站看到"真实"的浏览器环境）---
+        # --- 选择对应的 User-Agent ---
         if system == "Darwin":
             ua = (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -305,10 +313,20 @@ def _playwright_worker():
             )
 
         pw = sync_playwright().start()
+
+        # 获取全局代理管理器，用于 Playwright 浏览器代理
+        _pw_proxy_mgr = _get_proxy_manager()
+        _pw_current_proxy = _pw_proxy_mgr.get_proxy() if _pw_proxy_mgr.is_active else None
+        _pw_proxy_cfg = _pw_proxy_mgr.to_playwright_proxy(_pw_current_proxy) if _pw_current_proxy else None
+        _pw_consecutive_failures = 0
+        _pw_queries_since_proxy_rotate = 0
+        _pw_max_queries_per_proxy = random.randint(8, 15)  # 每个代理最多查询 N 次后轮换
         browser = pw.chromium.launch(
             headless=True,
             args=launch_args,
+            proxy=_pw_proxy_cfg,
         )
+        _pw_browser_proxy = _pw_current_proxy  # track which proxy browser was launched with
         context = browser.new_context(
             user_agent=ua,
             locale="zh-CN",
@@ -318,8 +336,8 @@ def _playwright_worker():
             java_script_enabled=True,
         )
         page = context.new_page()
+        page.set_default_timeout(15_000)
 
-        # 监听 API 响应（页面 JS 自动调用 detail.json，携带真实浏览器上下文）
         _captured = {}
 
         def _on_response(response):
@@ -333,12 +351,91 @@ def _playwright_worker():
 
         page.on('response', _on_response)
 
-        log("[OK] Playwright 浏览器已就绪（页面导航模式，自动绕过 CAPTCHA）")
+        # ── 人类行为模拟 ──────────────────────────────
+        def _pw_human_delay(min_ms: int = 200, max_ms: int = 1500):
+            """随机等待，模拟人类操作间隔。"""
+            time.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
 
-        _PLAYWRIGHT_READY_EVENT.set()
+        def _pw_random_mouse_move():
+            """在页面上随机移动鼠标，模拟真人浏览。"""
+            try:
+                vp = page.viewport_size
+                if vp:
+                    for _ in range(random.randint(1, 3)):
+                        x = random.randint(0, vp["width"])
+                        y = random.randint(0, vp["height"])
+                        page.mouse.move(x, y, steps=random.randint(5, 15))
+                        _pw_human_delay(50, 200)
+            except Exception:
+                pass
+
+        def _pw_random_scroll():
+            """模拟随机的页面滚动行为。"""
+            try:
+                vp = page.viewport_size
+                if vp:
+                    max_scroll = vp["height"] * random.randint(1, 3)
+                    steps = random.randint(3, 8)
+                    for _ in range(steps):
+                        delta = random.randint(50, 300)
+                        page.evaluate(f"window.scrollBy(0, {delta})")
+                        _pw_human_delay(100, 400)
+                    # 滚动回顶部
+                    page.evaluate("window.scrollTo(0, 0)")
+                    _pw_human_delay(100, 200)
+            except Exception:
+                pass
+
+        def _pw_human_simulate():
+            """综合人类行为模拟：鼠标移动 + 滚动 + 延迟。"""
+            _pw_random_mouse_move()
+            if random.random() < 0.4:  # 40% 概率滚动页面
+                _pw_random_scroll()
+            _pw_human_delay(300, 1000)
+
+        def _pw_rotate_browser_proxy():
+            """关闭当前浏览器，用新代理重新启动浏览器。"""
+            nonlocal _pw_current_proxy, _pw_proxy_cfg, _pw_browser_proxy
+            nonlocal _pw_consecutive_failures, _pw_queries_since_proxy_rotate
+            try:
+                context.close()
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+            _pw_current_proxy = _pw_proxy_mgr.get_proxy() if _pw_proxy_mgr.is_active else None
+            _pw_proxy_cfg = _pw_proxy_mgr.to_playwright_proxy(_pw_current_proxy) if _pw_current_proxy else None
+            _pw_browser_proxy = _pw_current_proxy
+            _pw_consecutive_failures = 0
+            _pw_queries_since_proxy_rotate = 0
+            # 重新启动
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=launch_args,
+                proxy=_pw_proxy_cfg,
+            )
+            # 重新创建 context + page
+            context = browser.new_context(
+                user_agent=ua,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1920, "height": 1080},
+                device_scale_factor=1,
+                java_script_enabled=True,
+            )
+            page = context.new_page()
+            page.set_default_timeout(15_000)
+            _captured.clear()
+            page.on('response', _on_response)
+            log(f"[PW-{worker_id}] 代理已轮换至 {_pw_current_proxy or '直连'}，浏览器已重启")
+
+        log(f"[PW-{worker_id}] Playwright Worker #{worker_id} 已就绪")
+
+        with _PLAYWRIGHT_LOCK:
+            _PLAYWRIGHT_READY_EVENT.set()  # signal at least one worker ready
 
         def _check_captcha() -> bool:
-            """检查当前页是否有滑块验证（NC 组件）"""
             try:
                 return page.evaluate("""() => {
                     const el = document.querySelector('.nc-container, #nocaptcha, [class*="nc-container"]');
@@ -349,80 +446,134 @@ def _playwright_worker():
             except Exception:
                 return False
 
-        def _try_navigate(mail_no: str, lang: str, max_attempts: int = 2) -> Optional[dict]:
-            """带滑块检测和自动重试的页面导航。超出尝试次数返回 None。"""
+        def _ensure_cainiao_origin():
+            try:
+                origin = page.evaluate("window.location.origin")
+                if origin and "global.cainiao.com" in origin:
+                    _pw_human_simulate()
+                    return True
+            except Exception:
+                pass
+            try:
+                _pw_human_simulate()
+                page.goto("https://global.cainiao.com/", wait_until="domcontentloaded", timeout=15_000)
+                _pw_human_delay(500, 1500)
+                return True
+            except Exception:
+                return False
+
+        def _try_fast_api(mail_no: str, lang: str):
+            if not _ensure_cainiao_origin():
+                return None
+            _pw_human_delay(300, 1200)
+            try:
+                result = page.evaluate(f"""
+                    async () => {{
+                        const url = 'https://global.cainiao.com/global/detail.json?mailNos={mail_no}&lang={lang}';
+                        try {{
+                            const resp = await fetch(url, {{
+                                credentials: 'include',
+                                headers: {{ 'Accept': 'application/json, text/plain, */*' }}
+                            }});
+                            if (!resp.ok) return null;
+                            return await resp.json();
+                        }} catch (e) {{
+                            return null;
+                        }}
+                    }}
+                """)
+                if isinstance(result, dict) and result.get("success") is not False:
+                    _pw_human_delay(200, 600)
+                    return result
+            except Exception as e:
+                log(f"[PW-{worker_id}] 快速 API 调用失败: {e}")
+            return None
+
+        def _try_navigate(mail_no: str, lang: str, max_attempts: int = 2):
             for attempt in range(1, max_attempts + 1):
                 _captured.clear()
+                # 模拟人类行为后再导航
+                _pw_human_simulate()
+                _pw_human_delay(500, 2000)
                 try:
                     page.goto(
                         f'https://global.cainiao.com/newDetail.htm?mailNoList={mail_no}&lang={lang}',
-                        wait_until='load',
-                        timeout=25_000,
+                        wait_until='domcontentloaded',
+                        timeout=20_000,
                     )
                 except Exception as nav_e:
-                    log(f"[PW-NAV] 导航失败(第{attempt}次): {nav_e}")
+                    log(f"[PW-{worker_id}] 导航失败(第{attempt}次): {nav_e}")
                     continue
 
-                # 等待轨迹元素渲染
-                try:
-                    page.wait_for_function(
-                        "() => document.querySelector('[class*=\"detail\"] li, .track-item, .timeline-item, [class*=\"timeline\"]') !== null",
-                        timeout=8_000,
-                    )
-                except Exception:
-                    pass
-
                 data = _captured.get('data')
+                if data is None:
+                    for _ in range(30):
+                        time.sleep(0.2)
+                        data = _captured.get('data')
+                        if data is not None:
+                            break
+
                 if data is not None:
                     return data
 
-                # 无 API 数据 → 检查滑块
                 if _check_captcha():
-                    log(f"[PW-CAPTCHA] 第{attempt}次触发了滑块，尝试绕过（首页→详情页）…")
+                    log(f"[PW-{worker_id}] 第{attempt}次触发了滑块，尝试绕过…")
+                    _pw_consecutive_failures += 1
                     try:
-                        page.goto("https://global.cainiao.com/", wait_until="load", timeout=15_000)
-                        log("[PW-CAPTCHA] 首页已加载，等待 2s 建立会话…")
+                        page.goto("https://global.cainiao.com/", wait_until="domcontentloaded", timeout=12_000)
                         time.sleep(2)
                     except Exception:
                         pass
-                    # 继续循环 → 下一次导航
                     continue
 
                 if attempt < max_attempts:
-                    log(f"[PW-RETRY] 页面无数据(第{attempt}次)，重试…")
+                    log(f"[PW-{worker_id}] 页面无数据(第{attempt}次)，重试…")
                     time.sleep(1)
             return None
 
         while True:
+            # 定期轮换代理：每个代理查询若干次后自动轮换
+            _pw_queries_since_proxy_rotate += 1
+            if _pw_proxy_mgr.is_active and _pw_queries_since_proxy_rotate >= _pw_max_queries_per_proxy:
+                log(f"[PW-{worker_id}] 达到最大查询次数({_pw_max_queries_per_proxy})，轮换代理…")
+                _pw_rotate_browser_proxy()
+                _pw_max_queries_per_proxy = random.randint(8, 15)
+
+            # 检查全局冷却
+            _check_global_cooldown()
+
             task_id, mail_no, lang = _PLAYWRIGHT_TASK_QUEUE.get()
-            if mail_no is None:   # shutdown
+            if mail_no is None:
                 break
             try:
-                data = _try_navigate(mail_no, lang, max_attempts=2)
+                data = _try_fast_api(mail_no, lang)
 
                 if data is None:
-                    # 最后手段：创建全新页面再试一次
-                    log("[PW-FALLBACK] 常规重试耗尽，尝试全新 Page…")
+                    data = _try_navigate(mail_no, lang, max_attempts=2)
+
+                if data is None:
+                    log(f"[PW-{worker_id}] 常规重试耗尽，尝试全新 Page…")
+                    _pw_consecutive_failures += 1
                     try:
                         page2 = context.new_page()
                         _captured.clear()
                         page2.on('response', _on_response)
                         page2.goto(
                             f'https://global.cainiao.com/newDetail.htm?mailNoList={mail_no}&lang={lang}',
-                            wait_until='load',
-                            timeout=25_000,
+                            wait_until='domcontentloaded',
+                            timeout=20_000,
                         )
-                        try:
-                            page2.wait_for_function(
-                                "() => document.querySelector('[class*=\"detail\"] li, .track-item, .timeline-item, [class*=\"timeline\"]') !== null",
-                                timeout=8_000,
-                            )
-                        except Exception:
-                            pass
-                        data = _captured.get('data')
+                        data2 = _captured.get('data')
+                        if data2 is None:
+                            for _ in range(30):
+                                time.sleep(0.2)
+                                data2 = _captured.get('data')
+                                if data2 is not None:
+                                    break
+                        data = data2
                         page2.close()
                     except Exception as p2_e:
-                        log(f"[PW-FALLBACK] 全新 Page 也失败: {p2_e}")
+                        log(f"[PW-{worker_id}] 全新 Page 也失败: {p2_e}")
 
                 if data is None:
                     has_captcha = _check_captcha()
@@ -432,7 +583,11 @@ def _playwright_worker():
                 if not isinstance(data, dict) or data.get('success') is False:
                     raise RuntimeError(f"API 返回异常: {json.dumps(data, ensure_ascii=False)[:200]}")
 
-                # ✅ 成功获取数据后提取 Cookies 注入 curl_cffi Session
+                # 成功：重置失败计数、上报成功
+                _pw_consecutive_failures = 0
+                _record_success()
+
+                # 提取 Cookies 注入 curl_cffi Session
                 try:
                     cookies = context.cookies()
                     with _PLAYWRIGHT_COOKIES_LOCK:
@@ -440,9 +595,17 @@ def _playwright_worker():
                         _PLAYWRIGHT_COOKIES.extend(cookies)
                     _inject_playwright_cookies()
                 except Exception as ce:
-                    log(f"[PW-COOKIE] Cookie 注入失败: {ce}")
+                    log(f"[PW-{worker_id}] Cookie 提取失败: {ce}")
 
             except Exception as e:
+                _pw_consecutive_failures += 1
+                _record_failure()
+                log(f"[PW-{worker_id}] 查询失败 ({mail_no}): {e}")
+                # 连续失败达到阈值 → 轮换代理 / 重启浏览器
+                if _pw_consecutive_failures >= 2 and _pw_proxy_mgr.is_active:
+                    if _pw_current_proxy:
+                        _pw_proxy_mgr.mark_failed(_pw_current_proxy)
+                    _pw_rotate_browser_proxy()
                 data = RuntimeError(f"Playwright 查询失败: {e}")
 
             with _PLAYWRIGHT_LOCK:
@@ -454,41 +617,49 @@ def _playwright_worker():
         context.close()
         browser.close()
         pw.stop()
+        log(f"[PW-{worker_id}] Worker #{worker_id} 已退出")
     except Exception as e:
-        log(f"[WARN] Playwright 工作线程初始化失败: {e}")
-        _PLAYWRIGHT_READY_EVENT.set()   # 防止死等
+        log(f"[PW-{worker_id}] Worker #{worker_id} 初始化失败: {e}")
+        with _PLAYWRIGHT_LOCK:
+            _PLAYWRIGHT_READY_EVENT.set()  # prevent deadlock
 
 
 def _ensure_playwright() -> bool:
-    """确保 Playwright 工作线程已启动（线程安全）。"""
-    global _PLAYWRIGHT_THREAD
-    if _PLAYWRIGHT_READY_EVENT.is_set() and (
-        _PLAYWRIGHT_THREAD and _PLAYWRIGHT_THREAD.is_alive()
+    """确保 Playwright 工作线程池已启动（线程安全）。"""
+    global _PLAYWRIGHT_WORKER_THREADS
+    if _PLAYWRIGHT_READY_EVENT.is_set() and any(
+        t.is_alive() for t in _PLAYWRIGHT_WORKER_THREADS
     ):
         return True
 
     with _PLAYWRIGHT_LOCK:
-        if _PLAYWRIGHT_READY_EVENT.is_set() and (
-            _PLAYWRIGHT_THREAD and _PLAYWRIGHT_THREAD.is_alive()
+        if _PLAYWRIGHT_READY_EVENT.is_set() and any(
+            t.is_alive() for t in _PLAYWRIGHT_WORKER_THREADS
         ):
             return True
-        if _PLAYWRIGHT_THREAD and _PLAYWRIGHT_THREAD.is_alive():
-            # 线程已启动，等待就绪
+
+        alive = [t for t in _PLAYWRIGHT_WORKER_THREADS if t.is_alive()]
+        needed = _PLAYWRIGHT_NUM_WORKERS - len(alive)
+        if needed <= 0:
             return _PLAYWRIGHT_READY_EVENT.wait(timeout=15)
 
         try:
             from playwright.sync_api import sync_playwright  # noqa: check import
         except ImportError:
             log("[WARN] Playwright 未安装，降级为纯 requests 模式")
-            log("[HINT] 如需降级绕过滑块，安装: pip install playwright && playwright install chromium")
             return False
 
         _PLAYWRIGHT_READY_EVENT.clear()
-        _PLAYWRIGHT_THREAD = threading.Thread(target=_playwright_worker, daemon=True)
-        _PLAYWRIGHT_THREAD.start()
 
-    # 等待 worker 就绪（最长 15 秒）
-    ready = _PLAYWRIGHT_READY_EVENT.wait(timeout=15)
+        for i in range(needed):
+            wid = len(alive) + i
+            t = threading.Thread(target=_playwright_worker, args=(wid,), daemon=True)
+            t.start()
+            _PLAYWRIGHT_WORKER_THREADS.append(t)
+        log(f"[PLAYWRIGHT] 启动 {needed} 个 Worker（共 {len(_PLAYWRIGHT_WORKER_THREADS)} 个）")
+
+    # 等待至少一个 worker 就绪（最长 20 秒）
+    ready = _PLAYWRIGHT_READY_EVENT.wait(timeout=20)
     if not ready:
         log("[WARN] Playwright 工作线程启动超时，降级为 requests")
         return False
@@ -509,8 +680,8 @@ def _playwright_query(mail_no: str, lang: str = "zh-CN") -> dict:
 
     _PLAYWRIGHT_TASK_QUEUE.put((task_id, mail_no, lang))
 
-    # 等待结果（最长 30 秒）
-    if not evt.wait(timeout=30):
+    # 等待结果（最长 20 秒）
+    if not evt.wait(timeout=20):
         with _PLAYWRIGHT_LOCK:
             _PLAYWRIGHT_EVENTS.pop(task_id, None)
             _PLAYWRIGHT_RESULTS.pop(task_id, None)
@@ -638,6 +809,181 @@ _TERMINAL_STATUS_CODES = frozenset({
 _QUERY_CACHE_ORDER = []        # 用于 LRU 淘汰的 key 列表
 
 
+# ============================================================
+# 方案 D：ProxyManager 代理轮询（绕过 IP 限流）
+# ============================================================
+# 环境变量配置：
+#   PROXY_LIST=http://user:pass@ip1:port,http://ip2:port,...    # 逗号分隔
+#   PROXY_MODE=rotate|direct              # rotate=轮询, direct=直连(默认)
+#   PROXY_CHECK_URL=https://global.cainiao.com/  # 用来测试代理存活
+#
+# 内置免费代理源（自动获取，仅当 PROXY_LIST 未设且 PROXY_MODE 非 direct 时生效）：
+#   proxy list download  |  每 5 分钟后台刷新一次
+# ============================================================
+
+_PROXY_MANAGER_READY = False
+_PROXY_MANAGER = None
+_PROXY_MANAGER_LOCK = threading.Lock()
+
+# 免费代理源（多个源提高获取成功率）
+_FREE_PROXY_SOURCES = [
+    # ProxyScrape（最稳定，纯 HTTP 列表）
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
+    # 备用 1
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    # 备用 2
+    "https://www.proxy-list.download/api/v1/get?type=http",
+]
+
+
+class ProxyManager:
+    """代理轮询管理器 — 支持静态列表 + 免费代理自动获取 + 失败熔断"""
+
+    def __init__(self):
+        self._proxies: list[str] = []
+        self._index = 0
+        self._lock = threading.Lock()
+        self._failed: set[str] = set()
+        self._last_fetch_time = 0
+        self._fetch_interval = 300  # 5 分钟刷新免费代理
+        self._mode = os.environ.get("PROXY_MODE", "").lower().strip()
+        self._proxy_list_raw = os.environ.get("PROXY_LIST", "").strip()
+        self._check_url = os.environ.get("PROXY_CHECK_URL", "https://global.cainiao.com/")
+
+    @property
+    def is_active(self) -> bool:
+        return self._mode == "rotate" and bool(self._proxies)
+
+    def init(self) -> bool:
+        """初始化代理列表，返回是否有可用代理。"""
+        # 1. 从环境变量解析
+        if self._proxy_list_raw:
+            parts = [p.strip() for p in self._proxy_list_raw.split(",") if p.strip()]
+            for p in parts:
+                if p and p not in self._proxies:
+                    self._proxies.append(p)
+            log(f"[PROXY] 环境变量加载 {len(self._proxies)} 个代理")
+
+        # 2. 模式 auto 或列表为空 —> 尝试获取免费代理
+        if self._proxies or self._mode == "direct":
+            return len(self._proxies) > 0
+
+        self._fetch_free_proxies()
+        return len(self._proxies) > 0
+
+    # ── 免费代理获取 ────────────────────────────────────
+
+    def _fetch_free_proxies(self):
+        now = time.time()
+        if now - self._last_fetch_time < self._fetch_interval:
+            return
+        self._last_fetch_time = now
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        fetched = []
+        raw_text = ""
+        for url in _FREE_PROXY_SOURCES:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+                with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                    raw_text = r.read().decode("utf-8", errors="replace")
+                if raw_text.strip():
+                    # 按换行分割，每行格式 ip:port
+                    candidates = [line.strip() for line in raw_text.splitlines() if ":" in line]
+                    for c in candidates:
+                        if c and c not in fetched and c not in self._proxies:
+                            fetched.append(c)
+                    log(f"[PROXY] {url.split('/')[2]} 获取到 {len(candidates)} 个代理")
+                    if fetched:
+                        break
+            except Exception as e:
+                log(f"[PROXY] 免费源 {url.split('/')[2]} 获取失败: {e}")
+                continue
+
+        if fetched:
+            # 快速验证前 5 个
+            alive = []
+            for p in fetched[:20]:
+                if self._check_proxy(p):
+                    alive.append(p)
+                    log(f"[PROXY] ✓ {p} 可用")
+            self._proxies.extend(alive)
+            log(f"[PROXY] 共获取 {len(fetched)} 个，存活 {len(alive)} 个")
+
+    def _check_proxy(self, proxy: str, timeout: int = 8) -> bool:
+        """测试单个代理是否可用。"""
+        try:
+            proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(proxy_handler)
+            req = urllib.request.Request(self._check_url)
+            with opener.open(req, timeout=timeout) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    # ── 轮询接口 ────────────────────────────────────
+
+    def get_proxy(self) -> Optional[str]:
+        """返回下一个可用代理（轮询）。"""
+        with self._lock:
+            if not self._proxies:
+                return None
+            available = [p for p in self._proxies if p not in self._failed]
+            if not available:
+                # 全部失败 → 重置（可能临时失效）
+                self._failed.clear()
+                available = list(self._proxies)
+            if self._index >= len(available):
+                self._index = 0
+            proxy = available[self._index]
+            self._index += 1
+            return proxy
+
+    def mark_failed(self, proxy: str):
+        """标记代理失败，后续轮询跳过。"""
+        with self._lock:
+            self._failed.add(proxy)
+            log(f"[PROXY] ✗ {proxy} 已标记失败（当前剩余 {len(self._proxies) - len(self._failed)} 个）")
+
+    # ── 与请求库集成 ────────────────────────────────────
+
+    def to_curl_proxies(self, proxy: Optional[str] = None) -> dict:
+        """转为 curl_cffi Session.get(proxies=...) 格式。"""
+        p = proxy or self.get_proxy()
+        if not p:
+            return {"http": "", "https": ""}
+        return {"http": p, "https": p}
+
+    def to_playwright_proxy(self, proxy: Optional[str] = None) -> Optional[dict]:
+        """转为 Playwright browser.new_context(proxy=...) 格式。"""
+        p = proxy or self.get_proxy()
+        if not p:
+            return None
+        return {"server": p}
+
+
+def _get_proxy_manager() -> ProxyManager:
+    """全局单例 ProxyManager。"""
+    global _PROXY_MANAGER, _PROXY_MANAGER_READY
+    if _PROXY_MANAGER_READY and _PROXY_MANAGER is not None:
+        return _PROXY_MANAGER
+    with _PROXY_MANAGER_LOCK:
+        if _PROXY_MANAGER_READY and _PROXY_MANAGER is not None:
+            return _PROXY_MANAGER
+        pm = ProxyManager()
+        ok = pm.init()
+        if ok:
+            log(f"[PROXY] 代理轮询已就绪（共 {len(pm._proxies)} 个代理）")
+        else:
+            log(f"[PROXY] 未配置代理，使用直连")
+        _PROXY_MANAGER = pm
+        _PROXY_MANAGER_READY = True
+        return pm
+
+
 def _cache_get(key: str) -> Optional[dict]:
     """从缓存读取，命中则刷新 LRU 顺序。"""
     entry = _QUERY_CACHE.get(key)
@@ -726,22 +1072,49 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
         return cached
     _req_ctx.cache_hit = False
 
-    # 每次查询前随机延时，模仿人类的操作间隔
+    _last_errors = []
+
+    # --- 方案 A（首要）：Playwright 真实浏览器，模拟真人操作绕过限流 ---
+    if _check_playwright_available():
+        log(f"[PRIMARY] 尝试 Playwright 查询 {mail_no}…")
+        try:
+            raw = _playwright_query(mail_no, lang)
+            if raw and raw.get("success") is not False:
+                log(f"[OK] Playwright 成功查询 {mail_no}")
+                _cache_set(cache_key, raw, ttl=_resolve_cache_ttl(raw))
+                return raw
+            log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
+        except Exception as pw_e:
+            log(f"[FALLBACK] Playwright 失败: {pw_e}")
+            _last_errors.append(f"[A] Playwright: {pw_e}")
+    else:
+        log("[FALLBACK] Playwright 浏览器未安装，跳过")
+        _last_errors.append("[A] Playwright: 未安装")
+
+    # --- Playwright 不可用/降级时：注入 Cookie + 随机延时（模仿人类操作间隔） ---
+    _inject_playwright_cookies()
     delay = random.uniform(QUERY_DELAY_MIN, QUERY_DELAY_MAX)
     log(f"[SLEEP] {mail_no} 等待 {delay:.1f}s…")
     time.sleep(delay)
 
-    # 注入之前 Playwright 提取的 cookies（如果有），降低滑块触发概率
-    _inject_playwright_cookies()
+    # 加载代理管理器（如果 PROXY_MODE=rotate 则自动轮询代理）
+    _proxy_mgr = _get_proxy_manager()
+    _current_proxy = None           # 当前使用的代理，限流时标记失败并轮换
 
-    # --- 方案 A：curl_cffi（TLS 指纹模拟浏览器，速度快） ---
-    proxies = {"http": "", "https": ""}
+    def _rotate_proxy():
+        """轮换到下一个代理，返回 proxies 字典。"""
+        nonlocal _current_proxy
+        _current_proxy = _proxy_mgr.get_proxy() if _proxy_mgr.is_active else None
+        if _current_proxy:
+            return _proxy_mgr.to_curl_proxies(_current_proxy)
+        return {"http": "", "https": ""}
+
+    proxies = _rotate_proxy()
     max_retries = 3
     max_rate_limit = 5          # 批量场景给更多限流重试机会
     normal_attempt = 0
     rate_limit_attempt = 0
     last_exc = None
-    _last_errors = []
 
     try:
         while normal_attempt < max_retries:
@@ -778,6 +1151,10 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                     is_rate_limited = "RGV587_ERROR" in err_text or "被挤爆" in err_text
                     if is_rate_limited:
                         rate_limit_attempt += 1
+                        # 标记当前代理失败并轮换
+                        if _current_proxy:
+                            _proxy_mgr.mark_failed(_current_proxy)
+                        proxies = _rotate_proxy()
                         # 累计连续限流，准备触发 Session 轮换
                         with _session_lock:
                             _session_rl_count += 1
@@ -866,21 +1243,7 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
             raise RuntimeError("curl_cffi 重试全部耗尽")
     except Exception as e:
         log(f"[WARN] curl_cffi 所有重试均失败: {e}")
-        _last_errors.append(f"[A] curl_cffi: {e}")
-
-    # --- 方案 B：Playwright（真实浏览器，绕过滑块验证） ---
-    if USE_PLAYWRIGHT and _check_playwright_available():
-        log(f"[FALLBACK] 尝试 Playwright 绕过 CAPTCHA 查询 {mail_no}…")
-        try:
-            raw = _playwright_query(mail_no, lang)
-            if raw and raw.get("success") is not False:
-                log(f"[OK] Playwright 成功查询 {mail_no}")
-                _cache_set(cache_key, raw, ttl=_resolve_cache_ttl(raw))
-                return raw
-            log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
-        except Exception as pw_e:
-            log(f"[FALLBACK] Playwright 也失败: {pw_e}")
-            _last_errors.append(f"[B] Playwright: {pw_e}")
+        _last_errors.append(f"[B] curl_cffi: {e}")
 
     # --- 方案 C：标准 urllib（零依赖，完全不同 TLS 指纹，绕过 curl_cffi 特殊特征） ---
     log(f"[FALLBACK] 尝试标准 urllib 查询 {mail_no}…")
@@ -888,16 +1251,29 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
         import ssl
         import urllib.request
 
-        # 复用已有 cookies（纯 HTTP 头格式）
+        # 复用已有 cookies — 兼容不同版本的 curl_cffi Cookies 对象
         with _session_lock:
             cj = _CAINIAO_SESSION.cookies
-            if hasattr(cj, 'get_dict'):
-                cookie_dict = cj.get_dict()
-                cookie_parts = [f"{k}={v}" for k, v in cookie_dict.items()]
-            elif isinstance(cj, dict):
-                cookie_parts = [f"{k}={v}" for k, v in cj.items()]
-            else:
-                cookie_parts = []
+            cookie_parts = []
+            try:
+                # 方法1：遍历标准 CookieJar（兼容 curl_cffi RequestsCookieJar 和标准库）
+                for cookie in cj:
+                    name = getattr(cookie, 'name', None)
+                    value = getattr(cookie, 'value', None)
+                    if name and value:
+                        cookie_parts.append(f"{name}={value}")
+            except Exception:
+                try:
+                    # 方法2：get_dict() 接口
+                    cookie_dict = cj.get_dict()
+                    cookie_parts = [f"{k}={v}" for k, v in cookie_dict.items()]
+                except Exception:
+                    try:
+                        # 方法3：纯 dict
+                        if isinstance(cj, dict):
+                            cookie_parts = [f"{k}={v}" for k, v in cj.items()]
+                    except Exception:
+                        cookie_parts = []
         cookie_header = "; ".join(cookie_parts) if cookie_parts else ""
 
         urllib_headers = {
@@ -916,15 +1292,27 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
         req_url = f"{PUBLIC_API_URL}?mailNo={quote(mail_no)}&lang={lang}"
         req = urllib.request.Request(req_url, headers=urllib_headers)
 
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            if body.get("success") is not False and body.get("module") is not None:
-                log(f"[OK] urllib 成功查询 {mail_no}")
-                _cache_set(cache_key, body, ttl=_resolve_cache_ttl(body))
-                return body
-            log(f"[WARN] urllib 返回异常: {json.dumps(body, ensure_ascii=False)[:200]}")
+        # urllib 也使用代理（如果已激活）
+        urllib_proxy = _current_proxy or _proxy_mgr.get_proxy()
+        if urllib_proxy:
+            proxy_handler = urllib.request.ProxyHandler({"http": urllib_proxy, "https": urllib_proxy})
+            urllib_opener = urllib.request.build_opener(proxy_handler)
+            with urllib_opener.open(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        else:
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+
+        if body.get("success") is not False and body.get("module") is not None:
+            log(f"[OK] urllib 成功查询 {mail_no}")
+            _cache_set(cache_key, body, ttl=_resolve_cache_ttl(body))
+            return body
+        log(f"[WARN] urllib 返回异常: {json.dumps(body, ensure_ascii=False)[:200]}")
     except Exception as ue:
         log(f"[FALLBACK] urllib 也失败: {ue}")
+        # 代理失败时标记，下次查询将轮换
+        if urllib_proxy:
+            _proxy_mgr.mark_failed(urllib_proxy)
         _last_errors.append(f"[C] urllib: {ue}")
 
     detail = " | ".join(_last_errors) if _last_errors else "全部查询方案均返回空"
