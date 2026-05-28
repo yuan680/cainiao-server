@@ -26,12 +26,14 @@ WPS 多维表按钮配置:
 """
 
 import json
+import ssl
 import sys
 import os
 import time
 import random
 import threading
 import queue
+import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 from datetime import datetime
