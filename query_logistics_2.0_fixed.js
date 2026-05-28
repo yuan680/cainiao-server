@@ -69,7 +69,7 @@ function queryMailNos(mailNos) {
     var url = API_URL + "?mailNo=" + encodeURIComponent(mailNos.join(","));
     for (var r = 0; r < 5; r++) {
         try {
-            var resp = HTTP.get(url, {timeout: 120000});  // 120s超时，Render 免费版限 50s，增加余量
+            var resp = HTTP.get(url);  // 不使用 timeout 参数（WPS AirScript 不支持 options 对象）
             if (resp) {
                 if (resp.status === 200) {
                     var text = resp.text();
@@ -135,7 +135,7 @@ function warmupServer() {
     for (var w = 0; w < 20; w++) {
         try {
             var url = API_URL + "?mailNo=" + testNos[0];
-            var resp = HTTP.get(url, {timeout: 120000});  // 预热也设120s超时
+            var resp = HTTP.get(url);  // 预热也使用无 options 调用
             if (resp && resp.status === 200) {
                 var text = resp.text();
                 if (text && text !== "" && text.indexOf("code") >= 0) {
