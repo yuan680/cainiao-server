@@ -45,7 +45,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── 4. 复制应用代码（仅部署必需文件） ──
-COPY cainiao_server.py .
+COPY cainiao_server.py gsheet_writer.py ./
 
 # Render / Cloud Run 自动注入 PORT 环境变量
 EXPOSE 58080

@@ -1,6 +1,22 @@
 # ════════════════════════════════════════════════════════════
 # 菜鸟物流查询 — Render Blueprint 部署配置
 # ════════════════════════════════════════════════════════════
+# 使用方式：
+#   1. 把代码推送到 GitHub
+#   2. 在 Render Dashboard 点击 "New +" → "Blueprint"
+#   3. 选择本仓库，Render 自动识别 render.yaml 并部署
+#
+# 住宅代理配置（PROXY_LIST）示例：
+#   - 自建代理池:  http://user:pass@ip1:port,http://user:pass@ip2:port,...
+#   - 住宅代理服务商:
+#       静态住宅:   http://user-session-random:pass@gateway.xxx.com:10000
+#       动态住宅:   http://user-turn-random:pass@gateway.xxx.com:10000
+#   - 免费代理池: 留空 PROXY_LIST，系统启动后自动后台抓取（存活率低，不推荐）
+#
+# 自定义域名（CNAME 到 Render 分配的 onrender.com 地址）:
+#   DNS 设置:  CNAME @  cainiao-server.onrender.com
+#   如果使用 Cloudflare，开启 Proxy（橙色云朵）可隐藏真实 IP
+# ============================================================
 services:
   # Web Service：菜鸟物流追踪 API
   - type: web
@@ -30,6 +46,25 @@ services:
         value: rotate
       - key: TZ
         value: Asia/Shanghai
+
+      # ──── Playwright Worker 数量（每 Worker ≈ 120-180MB RAM） ────
+      # Render 免费计划 512MB → 建议 1 个 Worker，留足够内存给系统
+      - key: PLAYWRIGHT_WORKERS
+        value: "1"
+
+      # ──── 代理池配置（取消注释并填写你的代理） ────
+      # - key: PROXY_LIST
+      #   value: "http://user:pass@gateway1:port,http://user:pass@gateway2:port"
+
+      # ──── 日志文件（云端仅 stdout，Render Dashboard 可查看） ────
+      # - key: LOG_FILE
+      #   value: ""
+
+      # ──── Google Sheets 写入（可选） ────
+      # - key: GOOGLE_SHEET_ID
+      #   value: "your_sheet_id"
+      # - key: GOOGLE_SHEET_CREDENTIALS
+      #   value: "/app/gsheet_creds.json"
 
     # 自动缩放 — 免费计划始终 1 实例
     scaling:

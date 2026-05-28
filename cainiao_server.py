@@ -163,7 +163,9 @@ def _record_success():
 PUBLIC_API_URL = "https://global.cainiao.com/global/detail.json"
 
 # 日志输出（WPS 请求时需要静默运行，日志写入文件可选）
-LOG_FILE = "cainiao_query.log"  # 每次请求的详细信息会写入此文件
+# 云端部署默认不写文件，仅 stdout（Render 自动捕获日志）
+# 如需本地调试文件日志，设置环境变量 LOG_FILE=1 或在 `--log-file` 参数指定路径
+LOG_FILE = os.environ.get("LOG_FILE", "")  # 留空 = 仅 stdout；非空路径 = 写入文件
 
 # ============================================================
 # Google Sheets 配置（留空则不启用）
@@ -190,7 +192,7 @@ _PLAYWRIGHT_TASK_QUEUE = queue.Queue()   # (task_id, mail_no, lang)
 _PLAYWRIGHT_RESULTS = {}                 # task_id -> dict | Exception
 _PLAYWRIGHT_EVENTS = {}                  # task_id -> threading.Event
 _PLAYWRIGHT_COUNTER = 0
-_PLAYWRIGHT_NUM_WORKERS = 3              # 并发 Worker 数量，每个拥有独立浏览器+页面
+_PLAYWRIGHT_NUM_WORKERS = int(os.environ.get("PLAYWRIGHT_WORKERS", 3))  # 并发 Worker 数量（Render 免费计划 512MB 建议 1）
 _PLAYWRIGHT_WORKER_THREADS: list[threading.Thread] = []
 _PLAYWRIGHT_READY_EVENT = threading.Event()
 
@@ -876,12 +878,27 @@ class ProxyManager:
                     self._proxies.append(p)
             log(f"[PROXY] 环境变量加载 {len(self._proxies)} 个代理")
 
-        # 2. 模式 auto 或列表为空 —> 尝试获取免费代理
+        # 2. 有静态代理 或 direct 模式 → 立即返回，不阻塞
         if self._proxies or self._mode == "direct":
             return len(self._proxies) > 0
 
-        self._fetch_free_proxies()
-        return len(self._proxies) > 0
+        # 3. 后台异步获取免费代理（不阻塞当前请求，ProxyScrape 等可能极慢或不可达）
+        self._start_background_fetch()
+        return False  # 暂时无可用代理，后台获取完成后自动可用
+
+    def _start_background_fetch(self):
+        """在后台线程获取免费代理，不影响首次查询速度。"""
+        def _task():
+            try:
+                self._fetch_free_proxies()
+                if self._proxies:
+                    log(f"[PROXY] 后台获取完成，共 {len(self._proxies)} 个代理可用")
+                else:
+                    log(f"[PROXY] 后台获取未找到可用免费代理，将使用直连")
+            except Exception as e:
+                log(f"[PROXY] 后台获取异常: {e}")
+        t = threading.Thread(target=_task, daemon=True)
+        t.start()
 
     # ── 免费代理获取 ────────────────────────────────────
 
@@ -900,7 +917,7 @@ class ProxyManager:
         for url in _FREE_PROXY_SOURCES:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-                with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                with urllib.request.urlopen(req, context=ctx, timeout=5) as r:
                     raw_text = r.read().decode("utf-8", errors="replace")
                 if raw_text.strip():
                     # 按换行分割，每行格式 ip:port
@@ -918,14 +935,14 @@ class ProxyManager:
         if fetched:
             # 快速验证前 5 个
             alive = []
-            for p in fetched[:20]:
+            for p in fetched[:5]:
                 if self._check_proxy(p):
                     alive.append(p)
                     log(f"[PROXY] ✓ {p} 可用")
             self._proxies.extend(alive)
             log(f"[PROXY] 共获取 {len(fetched)} 个，存活 {len(alive)} 个")
 
-    def _check_proxy(self, proxy: str, timeout: int = 8) -> bool:
+    def _check_proxy(self, proxy: str, timeout: int = 4) -> bool:
         """测试单个代理是否可用。"""
         try:
             proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -1109,19 +1126,23 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
     log(f"[SLEEP] {mail_no} 等待 {delay:.1f}s…")
     time.sleep(delay)
 
-    # 加载代理管理器（如果 PROXY_MODE=rotate 则自动轮询代理）
+    # 代理管理器（后台初始化，不阻塞首次直连）
     _proxy_mgr = _get_proxy_manager()
-    _current_proxy = None           # 当前使用的代理，限流时标记失败并轮换
+    _current_proxy = None
+    _proxy_enabled = False          # 默认直连，触发限流后启用代理
 
-    def _rotate_proxy():
-        """轮换到下一个代理，返回 proxies 字典。"""
-        nonlocal _current_proxy
-        _current_proxy = _proxy_mgr.get_proxy() if _proxy_mgr.is_active else None
-        if _current_proxy:
-            return _proxy_mgr.to_curl_proxies(_current_proxy)
+    def _rotate_proxy(enable: bool = False):
+        """启用/轮换代理，enable=True 在限流后强制启用。"""
+        nonlocal _current_proxy, _proxy_enabled
+        if enable:
+            _proxy_enabled = True
+        if _proxy_enabled and _proxy_mgr.is_active:
+            _current_proxy = _proxy_mgr.get_proxy()
+            if _current_proxy:
+                return _proxy_mgr.to_curl_proxies(_current_proxy)
         return {"http": "", "https": ""}
 
-    proxies = _rotate_proxy()
+    proxies = {"http": "", "https": ""}   # 首次直连，不走代理
     max_retries = 3
     max_rate_limit = 5          # 批量场景给更多限流重试机会
     normal_attempt = 0
@@ -1163,10 +1184,10 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
                     is_rate_limited = "RGV587_ERROR" in err_text or "被挤爆" in err_text
                     if is_rate_limited:
                         rate_limit_attempt += 1
-                        # 标记当前代理失败并轮换
+                        # 标记当前代理失败并轮换（触发限流后启用代理）
                         if _current_proxy:
                             _proxy_mgr.mark_failed(_current_proxy)
-                        proxies = _rotate_proxy()
+                        proxies = _rotate_proxy(enable=True)
                         # 累计连续限流，准备触发 Session 轮换
                         with _session_lock:
                             _session_rl_count += 1
