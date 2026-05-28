@@ -492,32 +492,136 @@ def _playwright_worker(worker_id: int):
             return None
 
         def _try_navigate(mail_no: str, lang: str, max_attempts: int = 2):
+            """完整模拟人类查询流程：首页 → 输入运单号 → 点击搜索 → 等待结果。
+
+            精确模仿真人操作：
+            1. 打开首页并等待加载
+            2. 鼠标移动到搜索框并点击
+            3. 逐字符输入运单号（模拟打字速度）
+            4. 随机微小停顿后点击搜索按钮
+            5. 等待结果页面加载 / 捕捉 detail.json 响应
+            """
             for attempt in range(1, max_attempts + 1):
                 _captured.clear()
-                # 模拟人类行为后再导航
-                _pw_human_simulate()
-                _pw_human_delay(500, 2000)
+
+                # ── 1. 访问首页 ──
                 try:
                     page.goto(
-                        f'https://global.cainiao.com/newDetail.htm?mailNoList={mail_no}&lang={lang}',
-                        wait_until='domcontentloaded',
-                        timeout=20_000,
+                        "https://global.cainiao.com/",
+                        wait_until="domcontentloaded",
+                        timeout=15_000,
                     )
                 except Exception as nav_e:
-                    log(f"[PW-{worker_id}] 导航失败(第{attempt}次): {nav_e}")
+                    log(f"[PW-{worker_id}] 首页导航失败(第{attempt}次): {nav_e}")
                     continue
 
-                data = _captured.get('data')
-                if data is None:
-                    for _ in range(30):
-                        time.sleep(0.2)
-                        data = _captured.get('data')
+                _pw_human_delay(800, 2000)
+
+                # ── 2. 模拟鼠标移动和滚动（更像真人） ──
+                _pw_random_mouse_move()
+                if random.random() < 0.5:
+                    _pw_random_scroll()
+
+                # ── 3. 定位搜索框，点击并输入运单号 ──
+                try:
+                    # 首页搜索框：input[placeholder*='运单号'] 或 .search-box input
+                    # 优先精确选择器，降级模糊匹配
+                    selectors = [
+                        "input[placeholder*='运单号']",
+                        "input[placeholder*='tracking']",
+                        ".search-box input",
+                        "#search-input",
+                        "input[type='text']",
+                    ]
+                    search_input = None
+                    for sel in selectors:
+                        try:
+                            el = page.wait_for_selector(sel, timeout=3000)
+                            if el:
+                                search_input = el
+                                break
+                        except Exception:
+                            continue
+
+                    if search_input is None:
+                        # 最后手段：遍历所有 input
+                        all_inputs = page.query_selector_all("input")
+                        for inp in all_inputs:
+                            ph = (inp.get_attribute("placeholder") or "").lower()
+                            if "运单" in ph or "track" in ph or "search" in ph:
+                                search_input = inp
+                                break
+
+                    if search_input:
+                        # 点击输入框
+                        search_input.click()
+                        _pw_human_delay(200, 500)
+                        # 逐字符输入（模拟真人打字速度）
+                        for ch in mail_no:
+                            page.keyboard.type(ch, delay=random.randint(30, 120))
+                            time.sleep(random.uniform(0.01, 0.05))
+                        _pw_human_delay(300, 800)
+
+                        # 按回车 / 点击搜索按钮
+                        search_btn = None
+                        for btn_sel in ["button.search-btn", "button[type='submit']",
+                                        ".search-btn", "button:has-text('搜索')"]:
+                            try:
+                                btn = page.query_selector(btn_sel)
+                                if btn:
+                                    search_btn = btn
+                                    break
+                            except Exception:
+                                continue
+                        if search_btn:
+                            _pw_random_mouse_move()
+                            search_btn.click()
+                        else:
+                            page.keyboard.press("Enter")
+                        _pw_human_delay(500, 1500)
+
+                        # 等待结果页面加载 → 拦截 detail.json
+                        for _ in range(40):
+                            time.sleep(0.25)
+                            data = _captured.get("data")
+                            if data is not None:
+                                break
+
                         if data is not None:
-                            break
+                            return data
 
-                if data is not None:
-                    return data
+                    else:
+                        # 找不到搜索框 → 降级到直接导航
+                        log(f"[PW-{worker_id}] 未找到搜索框，降级直连 newDetail.htm")
+                        page.goto(
+                            f'https://global.cainiao.com/newDetail.htm?mailNoList={mail_no}&lang={lang}',
+                            wait_until='domcontentloaded',
+                            timeout=20_000,
+                        )
+                        for _ in range(30):
+                            time.sleep(0.2)
+                            data = _captured.get('data')
+                            if data is not None:
+                                return data
 
+                except Exception as se_e:
+                    log(f"[PW-{worker_id}] 搜索框操作失败(第{attempt}次): {se_e}")
+                    # 降级到轮询等待 detail.json
+                    try:
+                        page.goto(
+                            f'https://global.cainiao.com/newDetail.htm?mailNoList={mail_no}&lang={lang}',
+                            wait_until='domcontentloaded',
+                            timeout=20_000,
+                        )
+                        for _ in range(30):
+                            time.sleep(0.2)
+                            data = _captured.get('data')
+                            if data is not None:
+                                return data
+                    except Exception:
+                        pass
+
+                # ── 4. 滑块检测 ──
                 if _check_captcha():
                     log(f"[PW-{worker_id}] 第{attempt}次触发了滑块，尝试绕过…")
                     _pw_consecutive_failures += 1
@@ -548,10 +652,12 @@ def _playwright_worker(worker_id: int):
             if mail_no is None:
                 break
             try:
-                data = _try_fast_api(mail_no, lang)
+                # ── 优先模拟人类完整浏览页面（真人操作） ──
+                data = _try_navigate(mail_no, lang, max_attempts=2)
 
+                # ── 降级：浏览器内 fetch API（更快但特征明显） ──
                 if data is None:
-                    data = _try_navigate(mail_no, lang, max_attempts=2)
+                    data = _try_fast_api(mail_no, lang)
 
                 if data is None:
                     log(f"[PW-{worker_id}] 常规重试耗尽，尝试全新 Page…")
@@ -1403,7 +1509,7 @@ class QueryHandler(BaseHTTPRequestHandler):
             log(f"[REQ] → {', '.join(mail_no_list)} (共{len(mail_no_list)}单)")
 
             # 分批查询：上游 API 对大批量有限制（建议每批 ≤20），拆成多个子批次并发执行
-            SUB_BATCH_SIZE = 20
+            SUB_BATCH_SIZE = 5  # 单批次最多5单，避免浏览器/上游返回超大数据
 
             def _process_sub_batch(sub_batch: list[str]) -> list[dict]:
                 """查询单个子批次（20 单），返回 parse_simplified 结果。"""
