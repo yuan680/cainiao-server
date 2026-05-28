@@ -1103,28 +1103,9 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
 
     _last_errors = []
 
-    # --- 方案 A（首要）：Playwright 真实浏览器，模拟真人操作绕过限流 ---
-    if _check_playwright_available():
-        log(f"[PRIMARY] 尝试 Playwright 查询 {mail_no}…")
-        try:
-            raw = _playwright_query(mail_no, lang)
-            if raw and raw.get("success") is not False:
-                log(f"[OK] Playwright 成功查询 {mail_no}")
-                _cache_set(cache_key, raw, ttl=_resolve_cache_ttl(raw))
-                return raw
-            log(f"[WARN] Playwright 返回异常: {json.dumps(raw, ensure_ascii=False)[:200]}")
-        except Exception as pw_e:
-            log(f"[FALLBACK] Playwright 失败: {pw_e}")
-            _last_errors.append(f"[A] Playwright: {pw_e}")
-    else:
-        log("[FALLBACK] Playwright 浏览器未安装，跳过")
-        _last_errors.append("[A] Playwright: 未安装")
-
-    # --- Playwright 不可用/降级时：注入 Cookie + 随机延时（模仿人类操作间隔） ---
+    # --- 方案 B（首选）：curl_cffi 直连（TLS 指纹），速度远快于 Playwright ---
+    # 注入 Playwright Cookie（如有），提升成功率
     _inject_playwright_cookies()
-    delay = random.uniform(QUERY_DELAY_MIN, QUERY_DELAY_MAX)
-    log(f"[SLEEP] {mail_no} 等待 {delay:.1f}s…")
-    time.sleep(delay)
 
     # 代理管理器（后台初始化，不阻塞首次直连）
     _proxy_mgr = _get_proxy_manager()
@@ -1347,6 +1328,64 @@ def query_cainiao(mail_no: str, lang: str = "zh-CN") -> dict:
         if urllib_proxy:
             _proxy_mgr.mark_failed(urllib_proxy)
         _last_errors.append(f"[C] urllib: {ue}")
+
+    # ---- 第4步：Playwright 降级方案（终极兜底） ----
+    try:
+        from playwright.sync_api import sync_playwright
+
+        log(f"[PLAYWRIGHT] 尝试通过 Playwright 查询 {mail_no} ...")
+        pw_proxy = _current_proxy or _proxy_mgr.get_proxy()
+        pw_proxy_settings = None
+        if pw_proxy:
+            pw_proxy_settings = {"server": pw_proxy}
+
+        pw_url = f"https://global.cainiao.com/global/detail.json?mailNo={mail_no}&lang={lang}"
+        pw_result = None
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                proxy=pw_proxy_settings,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context(
+                user_agent=random.choice(_USER_AGENTS),
+                locale="zh-CN",
+                extra_http_headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": f"https://global.cainiao.com/global/detail.json?mailNo={mail_no}",
+                },
+            )
+            page = context.new_page()
+            try:
+                resp = page.goto(pw_url, wait_until="domcontentloaded", timeout=15000)
+                body_text = page.inner_text("pre") or page.inner_text("body")
+                if resp:
+                    try:
+                        pw_result = resp.json()
+                    except Exception:
+                        pass
+                if not pw_result:
+                    try:
+                        pw_result = json.loads(body_text)
+                    except Exception:
+                        pass
+            except Exception as pw_e:
+                log(f"[PLAYWRIGHT] goto 失败: {pw_e}")
+            finally:
+                browser.close()
+
+        if pw_result and pw_result.get("success") is not False and pw_result.get("module") is not None:
+            log(f"[OK] Playwright 成功查询 {mail_no}")
+            _cache_set(cache_key, pw_result, ttl=_resolve_cache_ttl(pw_result))
+            return pw_result
+        log(f"[WARN] Playwright 返回异常或空结果")
+    except ImportError:
+        log(f"[PLAYWRIGHT] playwright 未安装，跳过")
+    except Exception as pw_e:
+        log(f"[PLAYWRIGHT] 执行异常: {pw_e}")
+        if pw_proxy:
+            _proxy_mgr.mark_failed(pw_proxy)
 
     detail = " | ".join(_last_errors) if _last_errors else "全部查询方案均返回空"
     raise RuntimeError(f"所有查询方案均失败 ({mail_no}): {detail}")
