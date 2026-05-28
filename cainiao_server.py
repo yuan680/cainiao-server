@@ -1687,10 +1687,10 @@ class QueryHandler(BaseHTTPRequestHandler):
             log(f"[REQ] → {', '.join(mail_no_list)} (共{len(mail_no_list)}单)")
 
             # 分批查询：上游 API 对大批量有限制（建议每批 ≤20），拆成多个子批次并发执行
-            SUB_BATCH_SIZE = 3  # 单批次最多3单，降低单次请求的限流命中概率
+            SUB_BATCH_SIZE = 15  # 每批最多15单，与WPS脚本对齐，大幅减少总请求数
 
             def _process_sub_batch(sub_batch: list[str]) -> list[dict]:
-                """查询单个子批次（20 单），返回 parse_simplified 结果。"""
+                """查询单个子批次（最多 15 单），返回 parse_simplified 结果。"""
                 sub_batch_local = []
                 sub_str = ",".join(sub_batch)
                 try:

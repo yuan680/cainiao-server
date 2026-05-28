@@ -32,9 +32,9 @@ var HEADER_NAMES = {
 // 已签收关键词（符合任一即跳过查询）
 var FINAL_STATUSES = ["妥投", "成功签收"];
 
-var BATCH_SIZE = 100;           // 每组处理行数（写入+查询，与SUB_BATCH_SIZE对齐）
-var SUB_BATCH_SIZE = 3;         // ★ 每个HTTP请求查询几个单号（降为3，对齐服务端子批次，避免Render 50s超时）
-var BETWEEN_REQUESTS_MS = 800;  // 请求间延迟基准值（每批3单耗时短，延迟可适当降低）
+var BATCH_SIZE = 100;           // 每组处理行数（WPS写入批量，与SUB_BATCH_SIZE独立）
+var SUB_BATCH_SIZE = 15;         // ★ 每个HTTP请求查询几个单号（增至15，让服务端利用4线程并行处理，大幅减少总请求数）
+var BETWEEN_REQUESTS_MS = 800;  // 请求间延迟基准值（大分批每批~6s，延迟保持1.2-1.6s防限流）
 var MAX_RUN_TIME_MS = 4.5 * 60 * 1000;
 
 // ─── 工具函数 ───────────────────────────────────
